@@ -7,8 +7,8 @@ from torchvision.models.detection import FasterRCNN
 from typing import Tuple, List, OrderedDict, Dict
 from collections.abc import Callable
 
-from constants import COCO_LABELS_LIST, COCO_COLORS_ARRAY, COCO_LABELS_MAP
-from proc_image import apply_dirtiness_map, refine_images, shift_features_dict
+from .constants import COCO_LABELS_LIST, COCO_COLORS_ARRAY, COCO_LABELS_MAP
+from .proc_image import apply_dirtiness_map, refine_images, shift_features_dict
 
 
 @torch.no_grad()
@@ -161,16 +161,17 @@ def visualize_detection(
             color = colors[labels[i]]
             x0, y0, x1, y1 = map(int, boxes[i])
             cv2.rectangle(image, (x0, y0), (x1, y1), (color * 255).astype(int).tolist(), 2)
-            cv2.putText(
-                image,
-                f"{COCO_LABELS_LIST[labels[i]]}: {scores[i]:.2f}",
-                (x0, y0 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (color * 255).astype(int).tolist(),
-                2,
-                cv2.LINE_AA,
-            )
+            if labels[i] != -1:
+                cv2.putText(
+                    image,
+                    f"{COCO_LABELS_LIST[labels[i]]}: {scores[i]:.2f}",
+                    (x0, y0 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (color * 255).astype(int).tolist(),
+                    2,
+                    cv2.LINE_AA,
+                )
 
     return image
 

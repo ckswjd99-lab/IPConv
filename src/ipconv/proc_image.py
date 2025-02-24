@@ -18,6 +18,32 @@ def apply_dirtiness_map(fname, feature, cache_features, dirtiness_map: torch.Ten
     return feature, dirtiness_map
 
 
+def expand_dirtiness_to_compute(dirtiness_map: torch.Tensor, kernel_size=6) -> torch.Tensor:
+    # dirtiness_map: (B, 1, H, W)
+    # we have to convolutional product with a kernel of size (kernel_size, kernel_size)
+    # the kernel is a square matrix with all elements equal to 1
+    kernel = torch.ones(1, 1, kernel_size, kernel_size, device=dirtiness_map.device)
+    dirtiness_map_expanded = F.conv2d(dirtiness_map, kernel, padding=kernel_size // 2, stride=1, groups=1)
+    dirtiness_map_expanded = (dirtiness_map_expanded > 0).float()
+
+    return dirtiness_map_expanded
+
+def create_compute_block(compute_map: torch.Tensor, block_size: int) -> torch.Tensor:
+    # compute_map: (B, 1, H, W)
+    # block_size: int
+    # return: (B, 1, H, W)
+    # split the compute_map into blocks of size (block_size, block_size)
+    # if any element in the block is 1, the block is 1
+    # otherwise, the block is 0
+    B, C, H, W = compute_map.shape
+    compute_map = compute_map.squeeze(1)
+    compute_map = compute_map.reshape(B, H // block_size, block_size, W // block_size, block_size)
+    compute_map = compute_map.max(dim=(2, 4)).values.unsqueeze(1)
+    compute_map = F.interpolate(compute_map, size=(H, W), mode='nearest')
+
+    return compute_map
+
+
 def shift_by_float(tensor: torch.Tensor, tvec: tuple[float, float]) -> torch.Tensor:
     B, C, H, W = tensor.shape
     tx, ty = tvec
