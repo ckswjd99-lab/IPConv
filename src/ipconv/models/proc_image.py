@@ -1,11 +1,15 @@
 import torch
 import torchvision
-import numpy as np
-import cv2
-
 from torch.nn import functional as F
 
+import numpy as np
+import cv2
+import os
+import matplotlib.pyplot as plt
+
 from typing import Tuple, Dict
+
+from .constants import COCO_COLORS_ARRAY, COCO_LABELS_LIST
 
 
 def apply_dirtiness_map(fname, feature, cache_features, dirtiness_map: torch.Tensor):
@@ -85,13 +89,15 @@ def shift_features_dict(
 def refine_images(
     anchor_image_ndarray: np.ndarray,
     target_image_ndarray: np.ndarray,
-) -> Tuple[np.ndarray, Tuple[float, float]]:
+) -> Tuple[np.ndarray | None, Tuple[float, float]]:
 
     gray1 = cv2.cvtColor(anchor_image_ndarray, cv2.COLOR_BGR2GRAY)
     gray2 = cv2.cvtColor(target_image_ndarray, cv2.COLOR_BGR2GRAY)
 
     # Shi-Tomasi corner detection
     corners = cv2.goodFeaturesToTrack(gray1, maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
+    if corners is None:
+        return None, (0, 0)
 
     # Lucas-Kanade optical flow calculation
     p1, st, err = cv2.calcOpticalFlowPyrLK(gray1, gray2, corners, None, winSize=(15, 15), maxLevel=2,
@@ -101,6 +107,8 @@ def refine_images(
     if p1 is not None and st is not None:
         good_new = p1[st == 1]
         good_old = corners[st == 1]
+        if good_old.shape[0] < 3:
+            return None, (0, 0)
 
         # Outlier removal using RANSAC
         matrix, inliers = cv2.estimateAffinePartial2D(good_old, good_new, method=cv2.RANSAC, ransacReprojThreshold=3)
@@ -108,8 +116,8 @@ def refine_images(
         inlier_new = good_new[inliers.flatten() == 1]
 
         # Calculate translation vector based on median (Translation Only)
-        # translation_vector = np.median(inlier_new - inlier_old, axis=0)
-        translation_vector = np.mean(inlier_new - inlier_old, axis=0)
+        translation_vector = np.median(inlier_new - inlier_old, axis=0)
+        # translation_vector = np.mean(inlier_new - inlier_old, axis=0)
         matrix = np.array([[1, 0, translation_vector[0]],
                            [0, 1, translation_vector[1]]], dtype=np.float32)
 
@@ -118,8 +126,96 @@ def refine_images(
 
         return aligned_image, tuple(translation_vector)
     else:
-        return np.zeros_like(anchor_image_ndarray), (0, 0)
+        return None, (0, 0)
     
+
+def calculate_iou(target_box, infer_box):
+    x1_gt, y1_gt, x2_gt, y2_gt = target_box
+    x1, y1, x2, y2 = infer_box
+
+    xA = max(x1, x1_gt)
+    yA = max(y1, y1_gt)
+    xB = min(x2, x2_gt)
+    yB = min(y2, y2_gt)
+
+    interArea = max(0, xB - xA + 1) * max(0, yB - yA + 1)
+
+    boxAArea = (x2 - x1 + 1) * (y2 - y1 + 1)
+    boxBArea = (x2_gt - x1_gt + 1) * (y2_gt - y1_gt + 1)
+
+    iou = interArea / float(boxAArea + boxBArea - interArea)
+
+    return iou
+
+
+def calculate_multi_iou(target_boxes, target_labels, infer_boxes, infer_labels):
+    iou_results = []
+    for target_box, target_label in zip(target_boxes, target_labels):
+        iou_list = [calculate_iou(target_box, infer_box) for infer_box, infer_label in zip(infer_boxes, infer_labels) if target_label == infer_label or target_label == -1]
+        iou_results.append(max(iou_list) if len(iou_list) > 0 else 0)
+
+    return iou_results
+
+
+def visualize_detection(
+    image: np.ndarray,
+    boxes: np.ndarray,
+    labels: np.ndarray,
+    scores: np.ndarray,
+    threshold: float = 0.9,
+    colors: np.ndarray = COCO_COLORS_ARRAY,
+) -> np.ndarray:
+    for i in range(len(boxes)):
+        if scores[i] > threshold:
+            color = colors[labels[i]]
+            x0, y0, x1, y1 = map(int, boxes[i])
+            cv2.rectangle(image, (x0, y0), (x1, y1), (color * 255).astype(int).tolist(), 2)
+            if labels[i] != -1:
+                cv2.putText(
+                    image,
+                    f"{COCO_LABELS_LIST[labels[i]]}: {scores[i]:.2f}",
+                    (x0, y0 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (color * 255).astype(int).tolist(),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+    return image
+
+
+def graph_iou(IoU_gt_results, IoU_full_results, sequence_name, gop, output_path):
+    avg_iou_gt = np.mean(IoU_gt_results)
+    avg_iou_full = np.mean(IoU_full_results)
+
+    plt.figure(figsize=(10, 5))
+    plt.title(f"Image sequence: {sequence_name}, GOP: {gop}")
+    plt.annotate(f"Average IoU (GT): {avg_iou_gt:.3f}", (0, 0), (0, -20), xycoords='axes fraction', textcoords='offset points', va='top')
+    plt.annotate(f"Average IoU (full): {avg_iou_full:.3f}", (0, 0), (0, -40), xycoords='axes fraction', textcoords='offset points', va='top')
+    plt.plot(IoU_gt_results, label="IoU (GT)")
+    plt.plot(IoU_full_results, label="IoU (full)")
+    plt.legend()
+    plt.xlabel("Frame")
+    plt.ylabel("IoU")
+    plt.grid()
+    plt.savefig(os.path.join(output_path, f"gop{gop}_iou.jpg"))
+    plt.close()
+
+
+def graph_recompute(compute_rates, sequence_name, gop, output_path):
+    avg_compute_rate = np.mean(compute_rates)
+
+    plt.figure(figsize=(10, 5))
+    plt.title(f"Image sequence: {sequence_name}, GOP: {gop}")
+    plt.annotate(f"Average recompute rate: {avg_compute_rate:.3f}", (0, 0), (0, -20), xycoords='axes fraction', textcoords='offset points', va='top')
+    plt.plot(compute_rates, label="Recompute rate")
+    plt.legend()
+    plt.xlabel("Frame")
+    plt.ylabel("Recompute rate")
+    plt.grid()
+    plt.savefig(os.path.join(output_path, f"gop{gop}_recompute.jpg"))
+    plt.close()
 
 if __name__ == "__main__":
     import os
