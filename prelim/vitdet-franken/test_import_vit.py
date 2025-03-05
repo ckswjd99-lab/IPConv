@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 from functools import partial
 
+import cv2
+
 from mini_det.modeling.backbone.vit import ViT
 from mini_det.modeling.backbone.vit import SimpleFeaturePyramid
 from mini_det.modeling.backbone.fpn import LastLevelMaxPool, ShapeSpec
@@ -27,14 +29,12 @@ from mini_det.modeling.roi_heads import (
 constants = dict(
     imagenet_rgb256_mean=[123.675, 116.28, 103.53],
     imagenet_rgb256_std=[58.395, 57.12, 57.375],
-    imagenet_bgr256_mean=[103.530, 116.280, 123.675],
-    imagenet_bgr256_std=[1.0, 1.0, 1.0],
 )
 
 embed_dim, depth, num_heads, dp = 768, 12, 12, 0.1
-# coco
 num_classes = 80
 
+# create model
 backbone = SimpleFeaturePyramid(
     net = ViT(
         img_size=1024,
@@ -131,48 +131,30 @@ model = GeneralizedRCNN(
             conv_norm="LN",
         ),
     ),
-    pixel_mean=constants["imagenet_bgr256_mean"],
-    pixel_std=constants["imagenet_bgr256_std"],
-    input_format="BGR",
+    pixel_mean=constants["imagenet_rgb256_mean"],
+    pixel_std=constants["imagenet_rgb256_std"],
+    input_format="RGB",
 )
 
+# load weight
 weight_pkl = './model_final_61ccd1.pkl'
-
 with open(weight_pkl, 'rb') as f:
     weights = pickle.load(f)['model']
 
-# load weight
 for name, param in model.named_parameters():
     if name in weights:
-        param.data = torch.tensor(weights[name])
+        param.data.copy_(torch.tensor(weights[name]))
     else:
         print(f"Parameter {name} not found in weights")
 
-
-# inference test
-model.eval()
-
-image_path = './test.jpg'
 # load image
-from PIL import Image
-import torchvision.transforms as T
+image_path = './000000000139.jpg'
+img = cv2.imread(image_path)
+img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+img = torch.tensor(img, dtype=torch.uint8).permute(2, 0, 1)
 
-img = Image.open(image_path)
-img = T.ToTensor()(img)
-print(f"Input image shape: {img.shape}")
-
-temp_input = [{"image": img}]
+# inference
+model.eval()
+temp_input = [{"image": img, "file_name": image_path, "height": img.shape[1], "width": img.shape[2]}]
 output = model(temp_input)
 print(output)
-
-exit(0)
-
-
-
-
-model_pnames = set([n for n, p in model.named_parameters()])
-weights_pnames = set(weights.keys())
-
-print(f"Intersection: {model_pnames & weights_pnames}")
-print(f"Model only: {model_pnames - weights_pnames}")
-print(f"Weights only: {weights_pnames - model_pnames}")
