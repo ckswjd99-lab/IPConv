@@ -1,7 +1,7 @@
 import torchvision
 import os
 
-from ipconv.models.FasterRCNN_ResNet50_FPN import FasterRCNN_ResNet50_FPN_Contexted
+from ipconv.models.fasterrcnn_resnet50_fpn import FasterRCNN_ResNet50_FPN_Contexted
 
 def main():
     
