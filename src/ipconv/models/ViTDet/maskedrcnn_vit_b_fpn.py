@@ -2,6 +2,7 @@ import pickle
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from functools import partial
 
 import numpy as np
@@ -10,12 +11,12 @@ import json
 import cv2
 from tqdm import tqdm
 
+from typing import List, Optional, Dict
+
 from .modeling.backbone.vit import ViT, SimpleFeaturePyramid
 from .modeling.backbone.utils import get_abs_pos, window_partition, window_unpartition, add_decomposed_rel_pos
 from .modeling.backbone.fpn import LastLevelMaxPool, ShapeSpec
-from .modeling.meta_arch import GeneralizedRCNN
 
-from .layers import ShapeSpec
 from .modeling.meta_arch import GeneralizedRCNN
 from .modeling.anchor_generator import DefaultAnchorGenerator
 from .modeling.backbone.fpn import LastLevelMaxPool
@@ -29,6 +30,11 @@ from .modeling.roi_heads import (
     MaskRCNNConvUpsampleHead,
     FastRCNNConvFCHead,
 )
+
+
+from .structures import ImageList
+from .layers import ShapeSpec
+from .layers.wrappers import move_device_like, shapes_to_tensor
 
 from ..proc_image import calculate_multi_iou, calculate_iou, visualize_detection
 
@@ -197,12 +203,28 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
 
     def forward_analyzed(self, image_ndarray: np.ndarray):
         # image_ndarray: (H, W, C)
-        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
+        
+        # pad the image to fixed size, and shift the image to the center
+        fixed_image_size = (1024, 1024)
+        shift_to_center = ((fixed_image_size[1] - image_ndarray.shape[1]) // 2, (fixed_image_size[0] - image_ndarray.shape[0]) // 2)
+
+        image_padded = np.zeros((fixed_image_size[0], fixed_image_size[1], 3), dtype=np.uint8)
+        image_padded[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
+        image_padded[shift_to_center[1]:shift_to_center[1] + image_ndarray.shape[0], shift_to_center[0]:shift_to_center[0] + image_ndarray.shape[1]] = image_ndarray
+        
+        # convert to tensor
+        image_tensor = torch.tensor(image_padded, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
         input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
         
         # preprocess
-        images = self.base_model.preprocess_image(input)
-        
+        images = [self.base_model._move_to_current_device(x["image"]) for x in input]
+        images = [(x - self.base_model.pixel_mean) / self.base_model.pixel_std for x in images]
+        images = ImageList.from_tensors(
+            images,
+            self.base_model.backbone.size_divisibility,
+            padding_constraints=self.base_model.backbone.padding_constraints,
+        )
+
         # inference: backbone
         backbone = self.base_model.backbone
         net = backbone.net
@@ -228,10 +250,8 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
             x_attn = x
 
             B_attn, H_attn, W_attn, _ = x_attn.shape
-            #   qkv with shape (3, B_attn, nHead, H_attn * W_attn, C)
-            qkv = block.attn.qkv(x_attn).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)
-            #   q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
-            q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)
+            qkv = block.attn.qkv(x_attn).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # qkv with shape (3, B_attn, nHead, H_attn * W_attn, C)
+            q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)  # q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
 
             attn = (q * block.attn.scale) @ k.transpose(-2, -1)
 
@@ -254,7 +274,6 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
 
             if block.use_residual_block:
                 x = self.residual(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
-
 
         # > FPN
         bottom_up_features = {net._out_features[0]: x.permute(0, 3, 1, 2)}
@@ -286,6 +305,12 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
         labels = predictions["instances"].pred_classes.cpu().numpy()
         scores = predictions["instances"].scores.cpu().numpy()
 
+        # shift the boxes back to the original image
+        boxes[:, 0] -= shift_to_center[0]
+        boxes[:, 1] -= shift_to_center[1]
+        boxes[:, 2] -= shift_to_center[0]
+        boxes[:, 3] -= shift_to_center[1]
+
         return boxes, labels, scores
     
     @torch.no_grad()
@@ -316,7 +341,8 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
             labels_gt = [-1 for box in annotation]
             scores_gt = [1.0 for _ in annotation]
 
-            boxes_pred, labels_pred, scores_pred = self.forward(target_image)
+            # boxes_pred, labels_pred, scores_pred = self.forward(target_image)
+            boxes_pred, labels_pred, scores_pred = self.forward_analyzed(target_image)
 
             inference_results[basename] = (boxes_pred, labels_pred, scores_pred)
 
