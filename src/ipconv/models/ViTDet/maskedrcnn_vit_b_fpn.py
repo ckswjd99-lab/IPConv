@@ -10,8 +10,8 @@ import json
 import cv2
 from tqdm import tqdm
 
-from .modeling.backbone.vit import ViT
-from .modeling.backbone.vit import SimpleFeaturePyramid
+from .modeling.backbone.vit import ViT, SimpleFeaturePyramid
+from .modeling.backbone.utils import get_abs_pos, window_partition, window_unpartition, add_decomposed_rel_pos
 from .modeling.backbone.fpn import LastLevelMaxPool, ShapeSpec
 from .modeling.meta_arch import GeneralizedRCNN
 
@@ -31,7 +31,6 @@ from .modeling.roi_heads import (
 )
 
 from ..proc_image import calculate_multi_iou, calculate_iou, visualize_detection
-from ..constants import COCO_LABELS_LIST
 
 
 class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
@@ -41,6 +40,26 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
         self.device = device
 
         # constants
+        self.COCO_LABELS_LIST = [
+            'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
+            'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign',
+            'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+            'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella',
+            'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
+            'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+            'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl',
+            'banana', 'apple', 'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza',
+            'donut', 'cake', 'chair', 'couch', 'potted plant', 'bed', 'dining table',
+            'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone',
+            'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book',
+            'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+        ]
+
+        np.random.seed(42)
+        self.COCO_COLORS_ARRAY = np.random.randint(256, size=(91, 3)) / 255
+        self.COCO_LABELS_MAP = {k: v for v, k in enumerate(self.COCO_LABELS_LIST)}
+
+
         constants = dict(
             imagenet_rgb256_mean=[123.675, 116.28, 103.53],
             imagenet_rgb256_std=[58.395, 57.12, 57.375],
@@ -175,6 +194,99 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
         scores = predictions["instances"].scores.cpu().numpy()
 
         return boxes, labels, scores
+
+    def forward_analyzed(self, image_ndarray: np.ndarray):
+        # image_ndarray: (H, W, C)
+        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
+        input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
+        
+        # preprocess
+        images = self.base_model.preprocess_image(input)
+        
+        # inference: backbone
+        backbone = self.base_model.backbone
+        net = backbone.net
+
+        # > ViT
+        x = net.patch_embed(images.tensor)
+        if net.pos_embed is not None:
+            x = x + get_abs_pos(
+                net.pos_embed, net.pretrain_use_cls_token, (x.shape[1], x.shape[2])
+            )
+
+        for bidx, block in enumerate(net.blocks):
+            # > EncoderBlock
+            shortcut = x
+            x = block.norm1(x)
+
+            # Window partition
+            if block.window_size > 0:
+                H, W = x.shape[1], x.shape[2]
+                x, pad_hw = window_partition(x, block.window_size)
+
+            # Attention
+            x_attn = x
+
+            B_attn, H_attn, W_attn, _ = x_attn.shape
+            #   qkv with shape (3, B_attn, nHead, H_attn * W_attn, C)
+            qkv = block.attn.qkv(x_attn).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)
+            #   q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
+            q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)
+
+            attn = (q * block.attn.scale) @ k.transpose(-2, -1)
+
+            if block.attn.use_rel_pos:
+                attn = add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn))
+
+            attn = attn.softmax(dim=-1)
+            x_attn = (attn @ v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
+            x_attn = block.attn.proj(x_attn)
+            
+            x = x_attn
+            
+            # Reverse window partition
+            if block.window_size > 0:
+                x = window_unpartition(x, block.window_size, pad_hw, (H, W))
+
+            # Residual
+            x = shortcut + block.drop_path(x)
+            x = x + block.drop_path(block.mlp(block.norm2(x)))
+
+            if block.use_residual_block:
+                x = self.residual(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+
+
+        # > FPN
+        bottom_up_features = {net._out_features[0]: x.permute(0, 3, 1, 2)}
+
+        features = bottom_up_features[backbone.in_feature]
+        results = []
+
+        for stage in backbone.stages:
+            results.append(stage(features))
+
+        if backbone.top_block is not None:
+            if backbone.top_block.in_feature in bottom_up_features:
+                top_block_in_feature = bottom_up_features[backbone.top_block.in_feature]
+            else:
+                top_block_in_feature = results[backbone._out_features.index(backbone.top_block.in_feature)]
+            results.extend(backbone.top_block(top_block_in_feature))
+        assert len(backbone._out_features) == len(results)
+        features = {f: res for f, res in zip(backbone._out_features, results)}
+
+        # inference: roi_heads
+        proposals, _ = self.base_model.proposal_generator(images, features, None)
+        results, _ = self.base_model.roi_heads(images, features, proposals, None)
+
+        # postprocess
+        detections = self.base_model._postprocess(results, input, images.image_sizes)
+
+        predictions = detections[0]
+        boxes = predictions["instances"].pred_boxes.tensor.cpu().numpy()
+        labels = predictions["instances"].pred_classes.cpu().numpy()
+        scores = predictions["instances"].scores.cpu().numpy()
+
+        return boxes, labels, scores
     
     @torch.no_grad()
     def validate_DAVIS_plain(self, sequence_name, data_root="/data/DAVIS", output_root="./output/maskedrcnn_vit_b_fpn", leave=False):
@@ -214,8 +326,8 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
 
             pbar.set_description(f"Processing {basename}, IoU: {iou:.4f}")
 
-            image_bbox_gt = visualize_detection(target_image, boxes_gt, labels_gt, scores_gt, colors=np.array([[0, 0, 255] for _ in range(len(COCO_LABELS_LIST))]))
-            image_bbox = visualize_detection(image_bbox_gt, boxes_pred, labels_pred, scores_pred)
+            image_bbox_gt = visualize_detection(target_image, boxes_gt, labels_gt, scores_gt, colors=np.array([[0, 0, 255] for _ in range(len(self.COCO_LABELS_LIST))]), labels_list=self.COCO_LABELS_LIST)
+            image_bbox = visualize_detection(image_bbox_gt, boxes_pred, labels_pred, scores_pred, labels_list=self.COCO_LABELS_LIST)
             cv2.imwrite(os.path.join(output_path, "temp", f"{basename}.jpg"), image_bbox)
         
         avg_iou = np.mean(IoU_results)

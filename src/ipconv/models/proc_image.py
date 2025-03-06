@@ -164,6 +164,7 @@ def visualize_detection(
     scores: np.ndarray,
     threshold: float = 0.9,
     colors: np.ndarray = COCO_COLORS_ARRAY,
+    labels_list: list[str] = COCO_LABELS_LIST,
 ) -> np.ndarray:
     for i in range(len(boxes)):
         if scores[i] > threshold:
@@ -173,7 +174,7 @@ def visualize_detection(
             if labels[i] != -1:
                 cv2.putText(
                     image,
-                    f"{COCO_LABELS_LIST[labels[i]]}: {scores[i]:.2f}",
+                    f"{labels_list[labels[i]]}: {scores[i]:.2f}",
                     (x0, y0 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
