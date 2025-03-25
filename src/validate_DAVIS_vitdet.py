@@ -1,0 +1,326 @@
+import os
+import cv2
+import numpy as np
+import torch
+import json
+from tqdm import tqdm
+
+from typing import Dict, Tuple
+
+from ipconv.models import MaskedRCNN_ViT_B_FPN_Contexted
+from ipconv.models.proc_image import visualize_detection, calculate_multi_iou, graph_iou, graph_recompute
+from ipconv.models.constants import COCO_LABELS_LIST
+
+def create_dirtiness_map(
+    anchor_image: np.ndarray, 
+    current_image: np.ndarray,
+    block_size: int = 16,
+    dirty_thres: int = 30,
+    chromakey: np.ndarray = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
+) -> torch.Tensor:
+    residual = cv2.absdiff(anchor_image, current_image)
+    
+    # inside current_image, if there is any pixel with chromakey color, set the residual as 0
+    # chromakey_mask = np.all(current_image == chromakey, axis=-1)
+    # residual[chromakey_mask] = 0
+
+    dirtiness_map = cv2.cvtColor(residual, cv2.COLOR_BGR2GRAY)
+
+    image_H, image_W = residual.shape[:2]
+    
+    dirtiness_map = cv2.GaussianBlur(dirtiness_map, (7, 7), 1.5)
+    dirtiness_map = (dirtiness_map > dirty_thres).astype(np.float32)
+
+    dirtiness_map = cv2.GaussianBlur(dirtiness_map, (15, 15), 1.5)
+    dirtiness_map = cv2.resize(dirtiness_map, (image_W // block_size, image_H // block_size), interpolation=cv2.INTER_LINEAR)
+    dirtiness_map = (dirtiness_map > 0).astype(np.float32)
+
+    dirtiness_map = torch.from_numpy(dirtiness_map).to("cuda")
+    dirtiness_map = dirtiness_map.unsqueeze(0).unsqueeze(-1)
+
+    return dirtiness_map
+
+def get_padded_image(image_ndarray: np.ndarray, size: Tuple[int, int], basic_scaling_factor: float = 1.05) -> np.ndarray:
+    image_scaled = cv2.resize(image_ndarray, (int(image_ndarray.shape[1] * basic_scaling_factor), int(image_ndarray.shape[0] * basic_scaling_factor)), interpolation=cv2.INTER_LINEAR)
+
+    shift_to_center = ((size[1] - image_scaled.shape[1]) // 2, (size[0] - image_scaled.shape[0]) // 2)
+
+    padded_image = np.zeros((size[0], size[1], 3), dtype=np.uint8)
+    padded_image[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
+    padded_image[shift_to_center[1]:shift_to_center[1] + image_scaled.shape[0], shift_to_center[0]:shift_to_center[0] + image_scaled.shape[1]] = image_scaled
+
+    return padded_image
+
+@torch.no_grad()
+def estimate_affine_in_padded_anchor(
+    anchor_padded_ndarray: np.ndarray,  # (1024, 1024, 3)
+    target_ndarray: np.ndarray,         # (H, W, 3)
+):
+    # Find and match keypoints
+    orb = cv2.ORB_create()
+    kp1, des1 = orb.detectAndCompute(target_ndarray, None)
+    kp2, des2 = orb.detectAndCompute(anchor_padded_ndarray, None)
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+
+    # Select good matches
+    good_matches = matches[:min(len(matches), 100)]
+
+    # Extract coordinates of matching points
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+    # Calculate Affine Transform
+    # affine_matrix, mask = cv2.estimateAffine2D(src_pts, dst_pts, cv2.RANSAC, ransacReprojThreshold=3.0)
+    affine_matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, cv2.RANSAC, ransacReprojThreshold=10.0)
+
+    return affine_matrix
+
+@torch.no_grad()
+def apply_affine_and_pad(
+    target_ndarray: np.ndarray,  # (H, W, 3)
+    affine_matrix: np.ndarray,  # (2, 3)
+) -> np.ndarray | None:
+    result_image = np.zeros((1024, 1024, 3), dtype=np.uint8)
+    H, W = target_ndarray.shape[:2]
+
+    transformed_target = cv2.warpAffine(target_ndarray, affine_matrix, (1024, 1024))
+    mask = transformed_target != 0
+
+    # Check if any part of the transformed image is outside the 1024x1024 bounds
+    points = np.array([[0, 0], [0, H], [W, 0], [W, H]], dtype=np.float32).reshape(-1, 1, 2)
+    transformed_points = cv2.transform(points, affine_matrix)
+    if np.any(transformed_points < 0) or np.any(transformed_points > 1024):
+        return None
+
+    result_image[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
+    result_image[mask] = transformed_target[mask]
+
+    return result_image
+
+@torch.no_grad()
+def affine_ground_truth_boxes(boxes_gt, affine_matrix):
+    transformed_boxes = []
+    for box in boxes_gt:
+        x1, y1, x2, y2 = box
+
+        point_lt = np.array([x1, y1], dtype=np.float32).reshape(-1, 1, 2)
+        point_rt = np.array([x2, y1], dtype=np.float32).reshape(-1, 1, 2)
+        point_lb = np.array([x1, y2], dtype=np.float32).reshape(-1, 1, 2)
+        point_rb = np.array([x2, y2], dtype=np.float32).reshape(-1, 1, 2)
+
+        src_pts = np.concatenate([point_lt, point_rt, point_lb, point_rb], axis=0)
+        dst_pts = cv2.transform(src_pts, affine_matrix)
+
+        x_min = int(np.mean(dst_pts[[0, 2], 0, 0]))
+        y_min = int(np.mean(dst_pts[[0, 1], 0, 1]))
+        x_max = int(np.mean(dst_pts[[1, 3], 0, 0]))
+        y_max = int(np.mean(dst_pts[[2, 3], 0, 1]))
+
+        transformed_boxes.append([x_min, y_min, x_max, y_max])
+    return transformed_boxes
+
+
+@torch.no_grad()
+def single_inference(
+    model: MaskedRCNN_ViT_B_FPN_Contexted,
+    anchor_padded_ndarray: np.ndarray,  # (1024, 1024, 3)
+    target_ndarray: np.ndarray,         # (H, W, 3)
+    anchor_features: Dict[str, torch.Tensor],
+    basic_scaling_factor: float = 1.05
+):
+    affine_matrix = estimate_affine_in_padded_anchor(anchor_padded_ndarray, target_ndarray)
+
+    target_padded_ndarray = apply_affine_and_pad(target_ndarray, affine_matrix)
+    
+    if target_padded_ndarray is None:
+        target_padded_ndarray = get_padded_image(target_ndarray, (1024, 1024), basic_scaling_factor)
+        (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(target_padded_ndarray)
+        
+        # affine matrix: translation with shift_to_center
+        target_scaled_ndarray = cv2.resize(target_ndarray, (int(target_ndarray.shape[1] * basic_scaling_factor), int(target_ndarray.shape[0] * basic_scaling_factor)), interpolation=cv2.INTER_LINEAR)
+        shift_to_center = ((1024 - target_scaled_ndarray.shape[1]) // 2, (1024 - target_scaled_ndarray.shape[0]) // 2)
+        affine_matrix = np.array([[1, 0, shift_to_center[0]], [0, 1, shift_to_center[1]]], dtype=np.float32)
+
+        return (boxes_cont, labels_cont, scores_cont), {
+            "affine_matrix": affine_matrix,
+            "target_padded_ndarray": target_padded_ndarray,
+            "dirtiness_map": torch.ones((1, 64, 64, 1), dtype=torch.float32, device="cuda"),
+            "cached_features_dict": cached_features_dict,
+        }
+    
+    else:
+        dirtiness_map = create_dirtiness_map(anchor_padded_ndarray, target_padded_ndarray)
+
+        (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(target_padded_ndarray, anchor_features=anchor_features, dirtiness_map=dirtiness_map)
+        
+        return (boxes_cont, labels_cont, scores_cont), {
+            "affine_matrix": affine_matrix,
+            "target_padded_ndarray": target_padded_ndarray,
+            "dirtiness_map": dirtiness_map,
+            "cached_features_dict": cached_features_dict,
+        }
+    
+
+@torch.no_grad()
+def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_dir="./output/contexted_inference_vitdet"):
+    # constants
+    fixed_image_size = (1024, 1024)
+    basic_scaling_factor = 1.05
+    
+    # load sequence
+    sequence_path = f"{data_root}/JPEGImages/480p/{sequence_name}"
+    image_names = sorted(os.listdir(sequence_path))
+
+    annotations_path = os.path.join(data_root, "Annotations_bbox/480p", f"{sequence_name}.json")
+    with open(annotations_path, "r") as f:
+        annotations = json.load(f)
+
+    output_path = f"{output_dir}/{sequence_name}"
+    os.makedirs(output_path, exist_ok=True)
+
+    # iterate over images
+    recompute_rates = []
+    IoU_gt_results = []
+
+
+    anchor_image_padded = None
+    anchor_features = None
+
+    refresh_anchor = True
+
+    pbar = tqdm(enumerate(image_names), total=len(image_names), leave=False)
+    for idx, iname in pbar:
+        basename = os.path.splitext(iname)[0]
+
+        # load ground truth
+        annotation = annotations.get(basename, [])  # List of bounding boxes, each box is in a format of {'x_min': 431, 'y_min': 230, 'x_max': 460, 'y_max': 260, 'label': '14'}
+
+        boxes_gt = [[float(box['x_min']), float(box['y_min']), float(box['x_max']), float(box['y_max'])] for box in annotation]
+        labels_gt = [-1 for box in annotation]
+        scores_gt = [1.0 for _ in annotation]
+
+        if idx % gop == 0 or anchor_image_padded is None or refresh_anchor:
+            current_image = cv2.imread(os.path.join(sequence_path, iname))
+
+            # scale with basic_scaling_factor
+            
+            current_image = cv2.resize(current_image, (int(current_image.shape[1] * basic_scaling_factor), int(current_image.shape[0] * basic_scaling_factor)), interpolation=cv2.INTER_LINEAR)
+
+            shift_to_center = ((fixed_image_size[1] - current_image.shape[1]) // 2, (fixed_image_size[0] - current_image.shape[0]) // 2)
+
+            current_image_padded = np.zeros((1024, 1024, 3), dtype=np.uint8)
+            current_image_padded[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
+            current_image_padded[shift_to_center[1]:shift_to_center[1] + current_image.shape[0], shift_to_center[0]:shift_to_center[0] + current_image.shape[1]] = current_image
+
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(current_image_padded)
+            
+            # affine matrix: translation with shift_to_center and scale with scaling_factor
+            affine_matrix = np.array([[basic_scaling_factor, 0, shift_to_center[0]], [0, basic_scaling_factor, shift_to_center[1]]], dtype=np.float32)
+            dirtiness_map = torch.ones((1, 64, 64, 1), dtype=torch.float32, device="cuda")
+
+            target_padded_ndarray = current_image_padded
+            anchor_image_padded = current_image_padded
+            anchor_features = cached_features_dict
+
+            refresh_anchor = False
+
+        else:
+            current_image = cv2.imread(os.path.join(sequence_path, iname))
+            
+            (boxes_cont, labels_cont, scores_cont), intermediate_dict = single_inference(model, anchor_image_padded, current_image, anchor_features=anchor_features)
+
+            affine_matrix = intermediate_dict["affine_matrix"]
+            target_padded_ndarray = intermediate_dict["target_padded_ndarray"]
+            dirtiness_map = intermediate_dict["dirtiness_map"]
+            cached_features_dict = intermediate_dict["cached_features_dict"]
+
+            # update padded anchor image
+            dmap_resized = cv2.resize(dirtiness_map[0, :, :, 0].cpu().numpy(), (target_padded_ndarray.shape[1], target_padded_ndarray.shape[0]), interpolation=cv2.INTER_NEAREST)
+            dmap_resized = np.stack([dmap_resized] * 3, axis=-1)
+            new_anchor_padded_ndarray = anchor_image_padded * (1 - dmap_resized) + target_padded_ndarray * dmap_resized
+
+            anchor_image_padded = new_anchor_padded_ndarray.astype(np.uint8)
+            anchor_features = cached_features_dict
+        
+        # affine ground truth
+        boxes_gt = affine_ground_truth_boxes(boxes_gt, affine_matrix)
+
+        # stats
+        IoU_gt = calculate_multi_iou(boxes_gt, labels_gt, boxes_cont, labels_cont)
+        IoU_gt_mean = np.mean(IoU_gt)
+        IoU_gt_results.append(IoU_gt_mean)
+        
+        scaling_factor = np.sqrt(np.linalg.det(affine_matrix[:2, :2]))
+        if scaling_factor < 0.98:
+            refresh_anchor = True
+
+        recompute_rate = np.mean(dirtiness_map.cpu().numpy())
+        recompute_rates.append(recompute_rate)
+
+        # visualize
+        dmap_resized = cv2.resize(dirtiness_map[0, :, :, 0].cpu().numpy(), (target_padded_ndarray.shape[1], target_padded_ndarray.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        target_padded_ndarray = target_padded_ndarray.astype(np.uint16)
+        target_padded_ndarray[:, :, 1] = np.clip(target_padded_ndarray[:, :, 1] + dmap_resized * 50, 0, 255)
+        target_padded_ndarray = target_padded_ndarray.astype(np.uint8)
+
+        vis_image = visualize_detection(target_padded_ndarray, boxes_gt, labels_gt, scores_gt, colors=np.array([[0, 0, 255] for _ in range(len(COCO_LABELS_LIST))]), labels_list=model.COCO_LABELS_LIST)
+        vis_image = visualize_detection(vis_image, boxes_cont, labels_cont, scores_cont, colors=np.array([[0, 255, 0] for _ in range(len(COCO_LABELS_LIST))]), labels_list=model.COCO_LABELS_LIST)
+
+        # write scaling factor at the left bottom corner
+        cv2.putText(vis_image, f"Scale: {scaling_factor:.2f}", (10, 1014), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+        os.makedirs(os.path.join(output_path, "temp"), exist_ok=True)
+        cv2.imwrite(os.path.join(output_path, "temp", f"{idx:05d}.jpg"), vis_image)
+
+        pbar.set_description(f"Recompute rate: {recompute_rate:.2f}, IoU (GT): {np.mean(IoU_gt):.2f}")
+    
+    # Make video of the results
+    video_path = os.path.join(output_path, f"gop{gop}.mp4")
+    os.system(f"ffmpeg -y -r 10 -i {output_path}/temp/%05d.jpg -c:v libx264 -vf fps=25 -pix_fmt yuv420p {video_path} > /dev/null 2>&1")
+    os.system(f"rm -rf {output_path}/temp")
+
+    # draw graphs
+    graph_iou(IoU_gt_results, IoU_gt_results, sequence_name, gop, output_path)
+    graph_recompute(recompute_rates, sequence_name, gop, output_path)
+
+    # avg_compute_rate, avg_iou_gt, avg_iou_full, inference_results
+    avg_compute_rate = np.mean(recompute_rates)
+    avg_iou_gt = np.mean(IoU_gt_results)
+
+    return avg_compute_rate, avg_iou_gt
+
+
+def main():
+
+    data_root = "/data/DAVIS"
+    output_dir = "./output/contexted_inference_vitdet"
+
+    model = MaskedRCNN_ViT_B_FPN_Contexted("cuda")
+    model.load_weight("./ipconv/models/model_final_61ccd1.pkl")
+    model.eval()
+
+    sequence_names = os.listdir("/data/DAVIS/JPEGImages/480p")
+    gops = [1, 6, 30, 100]
+
+    for sequence_name in sorted(sequence_names):
+        os.makedirs(f"{output_dir}/{sequence_name}", exist_ok=True)
+        log_file = open(f"{output_dir}/{sequence_name}/log.txt", "w")
+        
+        log_text = f"Sequence: {sequence_name}\n"
+
+        for gop in gops:
+            avg_compute_rate, avg_iou_gt = validate_DAVIS(model, sequence_name, gop, data_root, output_dir)
+            
+            log_text += f"\nGOP: {gop}\n  - Average recompute rate: {avg_compute_rate}\n  - Average IoU (GT): {avg_iou_gt}\n"
+        
+        print(log_text)
+        log_file.write(log_text)
+
+
+
+if __name__ == "__main__":
+    main()
