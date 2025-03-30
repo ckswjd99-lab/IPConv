@@ -3,12 +3,13 @@ import cv2
 import numpy as np
 import torch
 import json
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from typing import Dict, Tuple
 
 from ipconv.models import MaskedRCNN_ViT_B_FPN_Contexted
-from ipconv.models.proc_image import visualize_detection, calculate_multi_iou, graph_iou, graph_recompute
+from ipconv.models.proc_image import visualize_detection, calculate_multi_iou
 from ipconv.models.constants import COCO_LABELS_LIST
 
 def create_dirtiness_map(
@@ -129,13 +130,25 @@ def single_inference(
     anchor_padded_ndarray: np.ndarray,  # (1024, 1024, 3)
     target_ndarray: np.ndarray,         # (H, W, 3)
     anchor_features: Dict[str, torch.Tensor],
-    basic_scaling_factor: float = 1.05
+    basic_scaling_factor: float = 1.05,
+    recompute_threshold: float = 0.4,
 ):
     affine_matrix = estimate_affine_in_padded_anchor(anchor_padded_ndarray, target_ndarray)
 
     target_padded_ndarray = apply_affine_and_pad(target_ndarray, affine_matrix)
-    
-    if target_padded_ndarray is None:
+
+    # check if refresh is required
+    refresh_anchor = False
+    refresh_anchor |= (target_padded_ndarray is None)
+
+    if not refresh_anchor:
+        dirtiness_map = create_dirtiness_map(anchor_padded_ndarray, target_padded_ndarray)
+
+        recompute_rate = np.mean(dirtiness_map.cpu().numpy())
+        refresh_anchor |= (recompute_rate > recompute_threshold)
+
+    # do jobs
+    if refresh_anchor:
         target_padded_ndarray = get_padded_image(target_ndarray, (1024, 1024), basic_scaling_factor)
         (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(target_padded_ndarray)
         
@@ -169,6 +182,7 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
     # constants
     fixed_image_size = (1024, 1024)
     basic_scaling_factor = 1.05
+    recompute_threshold = 0.4
     
     # load sequence
     sequence_path = f"{data_root}/JPEGImages/480p/{sequence_name}"
@@ -202,23 +216,34 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
         labels_gt = [-1 for box in annotation]
         scores_gt = [1.0 for _ in annotation]
 
+        current_image = cv2.imread(os.path.join(sequence_path, iname))
+        
+        # set scaling factor
+        if current_image.shape[0] > fixed_image_size[0] or current_image.shape[1] > fixed_image_size[1]:
+            scaling_factor = min(fixed_image_size[0] / current_image.shape[0], fixed_image_size[1] / current_image.shape[1])
+        else:
+            scaling_factor = min(basic_scaling_factor, fixed_image_size[0] / current_image.shape[0], fixed_image_size[1] / current_image.shape[1])
+
         if idx % gop == 0 or anchor_image_padded is None or refresh_anchor:
-            current_image = cv2.imread(os.path.join(sequence_path, iname))
-
             # scale with basic_scaling_factor
+            # check if the scaled image is bigger than fixed_image_size
+            current_image = cv2.resize(current_image, (int(current_image.shape[1] * scaling_factor), int(current_image.shape[0] * scaling_factor)), interpolation=cv2.INTER_LINEAR)
             
-            current_image = cv2.resize(current_image, (int(current_image.shape[1] * basic_scaling_factor), int(current_image.shape[0] * basic_scaling_factor)), interpolation=cv2.INTER_LINEAR)
-
             shift_to_center = ((fixed_image_size[1] - current_image.shape[1]) // 2, (fixed_image_size[0] - current_image.shape[0]) // 2)
 
             current_image_padded = np.zeros((1024, 1024, 3), dtype=np.uint8)
             current_image_padded[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
             current_image_padded[shift_to_center[1]:shift_to_center[1] + current_image.shape[0], shift_to_center[0]:shift_to_center[0] + current_image.shape[1]] = current_image
 
+            flops = calculate_flops(model, (1, 3, 1024, 1024))
+            print(f"FLOPS: {flops / 1e9:.2f} G")
+            exit(0)
+
+
             (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(current_image_padded)
             
             # affine matrix: translation with shift_to_center and scale with scaling_factor
-            affine_matrix = np.array([[basic_scaling_factor, 0, shift_to_center[0]], [0, basic_scaling_factor, shift_to_center[1]]], dtype=np.float32)
+            affine_matrix = np.array([[scaling_factor, 0, shift_to_center[0]], [0, scaling_factor, shift_to_center[1]]], dtype=np.float32)
             dirtiness_map = torch.ones((1, 64, 64, 1), dtype=torch.float32, device="cuda")
 
             target_padded_ndarray = current_image_padded
@@ -228,9 +253,14 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
             refresh_anchor = False
 
         else:
-            current_image = cv2.imread(os.path.join(sequence_path, iname))
-            
-            (boxes_cont, labels_cont, scores_cont), intermediate_dict = single_inference(model, anchor_image_padded, current_image, anchor_features=anchor_features)
+            (boxes_cont, labels_cont, scores_cont), intermediate_dict = single_inference(
+                model, 
+                anchor_image_padded, 
+                current_image, 
+                anchor_features=anchor_features, 
+                recompute_threshold=recompute_threshold,
+                basic_scaling_factor=basic_scaling_factor,
+            )
 
             affine_matrix = intermediate_dict["affine_matrix"]
             target_padded_ndarray = intermediate_dict["target_padded_ndarray"]
@@ -283,15 +313,14 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
     os.system(f"ffmpeg -y -r 10 -i {output_path}/temp/%05d.jpg -c:v libx264 -vf fps=25 -pix_fmt yuv420p {video_path} > /dev/null 2>&1")
     os.system(f"rm -rf {output_path}/temp")
 
-    # draw graphs
-    graph_iou(IoU_gt_results, IoU_gt_results, sequence_name, gop, output_path)
-    graph_recompute(recompute_rates, sequence_name, gop, output_path)
-
     # avg_compute_rate, avg_iou_gt, avg_iou_full, inference_results
     avg_compute_rate = np.mean(recompute_rates)
     avg_iou_gt = np.mean(IoU_gt_results)
 
-    return avg_compute_rate, avg_iou_gt
+    return avg_compute_rate, avg_iou_gt, {
+        "recompute_rates": recompute_rates,
+        "IoU_gt_results": IoU_gt_results,
+    }
 
 
 def main():
@@ -303,23 +332,56 @@ def main():
     model.load_weight("./ipconv/models/model_final_61ccd1.pkl")
     model.eval()
 
-    sequence_names = os.listdir("/data/DAVIS/JPEGImages/480p")
+    sequence_names = sorted(os.listdir("/data/DAVIS/JPEGImages/480p"))
     gops = [1, 6, 30, 100]
 
-    for sequence_name in sorted(sequence_names):
+    for sequence_name in sequence_names:
+        recompute_rates = {}
+        iou_gt_results = {}
+
         os.makedirs(f"{output_dir}/{sequence_name}", exist_ok=True)
         log_file = open(f"{output_dir}/{sequence_name}/log.txt", "w")
-        
-        log_text = f"Sequence: {sequence_name}\n"
 
         for gop in gops:
-            avg_compute_rate, avg_iou_gt = validate_DAVIS(model, sequence_name, gop, data_root, output_dir)
-            
-            log_text += f"\nGOP: {gop}\n  - Average recompute rate: {avg_compute_rate}\n  - Average IoU (GT): {avg_iou_gt}\n"
+            avg_compute_rate, avg_iou_gt, stat_dicts = validate_DAVIS(model, sequence_name, gop, data_root, output_dir)
+            recompute_rates[gop] = stat_dicts["recompute_rates"]
+            iou_gt_results[gop] = stat_dicts["IoU_gt_results"]
         
+        log_text = f"{sequence_name}, {np.mean(recompute_rates[1])}, {np.mean(recompute_rates[6])}, {np.mean(recompute_rates[30])}, {np.mean(recompute_rates[100])}, {np.mean(iou_gt_results[1])}, {np.mean(iou_gt_results[6])}, {np.mean(iou_gt_results[30])}, {np.mean(iou_gt_results[100])}\n"
+
         print(log_text)
         log_file.write(log_text)
 
+        # draw graphs
+        # recompute rates
+        plt.figure(figsize=(10, 5))
+        plt.title(f"Image sequence: {sequence_name}", fontsize=20)  # Increased font size
+        for gop in gops:
+            plt.plot(recompute_rates[gop], label=f"GOP={gop}")
+        plt.legend(fontsize=14)
+        plt.xlabel("Frame", fontsize=16)
+        plt.ylabel("Recompute rate", fontsize=16)
+        plt.xticks(fontsize=14)
+        plt.yticks(fontsize=14)
+        plt.grid()
+        plt.savefig(f"{output_dir}/{sequence_name}/recompute_rates.jpg")
+        plt.close()
+
+        # IoU results
+        plt.figure(figsize=(10, 5))
+        plt.title(f"Image sequence: {sequence_name}", fontsize=20)
+        for gop in gops:
+            plt.plot(iou_gt_results[gop], label=f"GOP={gop}")
+        plt.legend(fontsize=14)
+        plt.xlabel("Frame", fontsize=16)
+        plt.ylabel("IoU (GT)", fontsize=16)
+        plt.xticks(fontsize=14)
+        plt.yticks(fontsize=14)
+        plt.grid()
+        plt.savefig(f"{output_dir}/{sequence_name}/iou_results.jpg")
+        plt.close()
+
+    log_file.close()
 
 
 if __name__ == "__main__":

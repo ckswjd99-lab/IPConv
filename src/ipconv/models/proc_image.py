@@ -191,14 +191,16 @@ def graph_iou(IoU_gt_results, IoU_full_results, sequence_name, gop, output_path)
     avg_iou_full = np.mean(IoU_full_results)
 
     plt.figure(figsize=(10, 5))
-    plt.title(f"Image sequence: {sequence_name}, GOP: {gop}")
-    plt.annotate(f"Average IoU (GT): {avg_iou_gt:.3f}", (0, 0), (0, -20), xycoords='axes fraction', textcoords='offset points', va='top')
-    plt.annotate(f"Average IoU (full): {avg_iou_full:.3f}", (0, 0), (0, -40), xycoords='axes fraction', textcoords='offset points', va='top')
+    plt.title(f"Image sequence: {sequence_name}, GOP: {gop}", fontsize=20)  # Increased font size
+    plt.annotate(f"Average IoU (GT): {avg_iou_gt:.3f}", (0, 0), (0, -20), xycoords='axes fraction', textcoords='offset points', va='top', fontsize=14)  # Increased font size
+    plt.annotate(f"Average IoU (full): {avg_iou_full:.3f}", (0, 0), (0, -40), xycoords='axes fraction', textcoords='offset points', va='top', fontsize=14)  # Increased font size
     plt.plot(IoU_gt_results, label="IoU (GT)")
     plt.plot(IoU_full_results, label="IoU (full)")
-    plt.legend()
-    plt.xlabel("Frame")
-    plt.ylabel("IoU")
+    plt.legend(fontsize=14)  # Increased font size
+    plt.xlabel("Frame", fontsize=16)  # Increased font size
+    plt.ylabel("IoU", fontsize=16)  # Increased font size
+    plt.xticks(fontsize=14)  # Set x-axis tick label font size
+    plt.yticks(fontsize=14)  # Set y-axis tick label font size
     plt.grid()
     plt.savefig(os.path.join(output_path, f"gop{gop}_iou.jpg"))
     plt.close()
@@ -208,12 +210,14 @@ def graph_recompute(compute_rates, sequence_name, gop, output_path):
     avg_compute_rate = np.mean(compute_rates)
 
     plt.figure(figsize=(10, 5))
-    plt.title(f"Image sequence: {sequence_name}, GOP: {gop}")
-    plt.annotate(f"Average recompute rate: {avg_compute_rate:.3f}", (0, 0), (0, -20), xycoords='axes fraction', textcoords='offset points', va='top')
+    plt.title(f"Image sequence: {sequence_name}, GOP: {gop}", fontsize=20)  # Increased font size
+    plt.annotate(f"Average recompute rate: {avg_compute_rate:.3f}", (0, 0), (0, -20), xycoords='axes fraction', textcoords='offset points', va='top', fontsize=14)  # Increased font size
     plt.plot(compute_rates, label="Recompute rate")
-    plt.legend()
-    plt.xlabel("Frame")
-    plt.ylabel("Recompute rate")
+    plt.legend(fontsize=14)  # Increased font size
+    plt.xlabel("Frame", fontsize=16)  # Increased font size
+    plt.ylabel("Recompute rate", fontsize=16)  # Increased font size
+    plt.xticks(fontsize=14)  # Set x-axis tick label font size
+    plt.yticks(fontsize=14)  # Set y-axis tick label font size
     plt.grid()
     plt.savefig(os.path.join(output_path, f"gop{gop}_recompute.jpg"))
     plt.close()
