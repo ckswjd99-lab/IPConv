@@ -235,11 +235,6 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
             current_image_padded[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
             current_image_padded[shift_to_center[1]:shift_to_center[1] + current_image.shape[0], shift_to_center[0]:shift_to_center[0] + current_image.shape[1]] = current_image
 
-            flops = calculate_flops(model, (1, 3, 1024, 1024))
-            print(f"FLOPS: {flops / 1e9:.2f} G")
-            exit(0)
-
-
             (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(current_image_padded)
             
             # affine matrix: translation with shift_to_center and scale with scaling_factor
