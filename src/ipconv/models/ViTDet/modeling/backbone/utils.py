@@ -184,3 +184,39 @@ class PatchEmbed(nn.Module):
         # B C H W -> B H W C
         x = x.permute(0, 2, 3, 1)
         return x
+
+
+def partial_mlp_inference(x, dmap, mlp_module, drop_path_fn=None):
+    """
+    x: (B, H, W, C)
+    dmap: (B, H, W, 1), with values 0 or 1
+    mlp_module: an MLP (FFN) module for f(x) (e.g., block.mlp)
+    drop_path_fn: optional drop_path function (e.g., block.drop_path)
+    
+    Returns:
+        (B, H, W, C) where only positions with dmap=1 are updated by the MLP.
+    """
+    B, H, W, C = x.shape
+    
+    # Reshape dmap to (B, H*W)
+    dmap_flat = dmap.view(B, -1)
+    # Reshape x to (B, H*W, C)
+    x_flat = x.view(B, -1, C)
+    
+    for b in range(B):
+        dirty_indices = torch.nonzero(dmap_flat[b], as_tuple=True)[0]
+        if dirty_indices.numel() == 0:
+            continue
+        
+        dirty_tokens = x_flat[b, dirty_indices, :]
+        
+        updated_tokens = mlp_module(dirty_tokens)
+        
+        if drop_path_fn is not None:
+            updated_tokens = drop_path_fn(updated_tokens)
+        
+        x_flat[b, dirty_indices, :] = updated_tokens
+    
+    # Reshape back to (B, H, W, C)
+    x = x_flat.view(B, H, W, C)
+    return x

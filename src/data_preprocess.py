@@ -5,7 +5,7 @@ import cv2
 
 from tqdm import tqdm
 
-input_base_path = "/data/DAVIS/Annotations_unsupervised/480p/"
+input_base_path = "/data/DAVIS/Annotations/480p/"
 output_base_path = "/data/DAVIS/Annotations_bbox/480p/"
 
 os.makedirs(output_base_path, exist_ok=True)

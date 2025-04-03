@@ -15,7 +15,7 @@ from tqdm import tqdm
 from typing import List, Optional, Dict, Tuple, Union
 
 from .modeling.backbone.vit import ViT, SimpleFeaturePyramid
-from .modeling.backbone.utils import get_abs_pos, window_partition, window_unpartition, add_decomposed_rel_pos
+from .modeling.backbone.utils import get_abs_pos, window_partition, window_unpartition, add_decomposed_rel_pos, partial_mlp_inference
 from .modeling.backbone.fpn import LastLevelMaxPool, ShapeSpec
 
 from .modeling.meta_arch import GeneralizedRCNN
@@ -237,7 +237,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
             self, 
             image_ndarray: np.ndarray, 
             anchor_features: Dict[str, torch.Tensor] = {},
-            dirtiness_map: torch.Tensor = torch.randn(1, 64, 64, 1).to("cuda"),
+            dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1).to("cuda"),
         ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], Dict[str, torch.Tensor]]:
         # image_ndarray: (H, W, C)
 
@@ -270,12 +270,10 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
         # x: Tensor(1, 64, 64, 768)
         # dirtiness_map: Tensor(1, 64, 64, 1)
         fname = "input_patched"
-        new_cache_feature[fname] = x.clone()    # (B, H, W, C)
         if fname in anchor_features:
             dmap_channeled = dirtiness_map.expand(-1, -1, -1, x.shape[-1])
-            # print(f"x: {x.shape}, anchor_features[fname]: {anchor_features[fname].shape}, dmap_channeled: {dmap_channeled.shape}")
             x = x * dmap_channeled + anchor_features[fname] * (1 - dmap_channeled)
-
+        new_cache_feature[fname] = x.clone()    # (B, H, W, C)
 
         for bidx, block in enumerate(net.blocks):
             # > EncoderBlock
@@ -283,7 +281,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
             x = block.norm1(x)
 
             # Window partition
-            dmap_block = dirtiness_map.clone()
+            dmap_block = dirtiness_map.clone() if bidx < 11 else torch.ones_like(dirtiness_map, device=self.device)
             dmap_window = None
             if block.window_size > 0:
                 H, W = x.shape[1], x.shape[2]
@@ -294,23 +292,33 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
 
             # Attention
             x_attn = x
-
             B_attn, H_attn, W_attn, _ = x_attn.shape
-            qkv = block.attn.qkv(x_attn).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # qkv with shape (3, B_attn, nHead, H_attn * W_attn, C)
+
+            dmap_now = dmap_window if dmap_window is not None else dmap_block
+            dmap_now_flat = dmap_now.reshape(-1)
+
+            # partial QKV generation
+            x_attn_flat = x_attn.reshape(-1, 768)
+            x_attn_selected = x_attn_flat[dmap_now_flat == 1, :]
+            qkv_selected = block.attn.qkv(x_attn_selected)
+
+            qkv_flat = torch.zeros(B_attn * H_attn * W_attn, 3 * 768, device=self.device)
+            qkv_flat[dmap_now_flat == 1, :] = qkv_selected
+
+            qkv = qkv_flat.reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # qkv with shape (3, B_attn, nHead, H_attn * W_attn, C)
 
             fname = f"block{bidx}_attn_qkv"
-            new_cache_feature[fname] = qkv.clone()
             if fname in anchor_features:
                 if dmap_window is not None:
                     qkv = qkv.permute(0, 2, 1, 3, 4)    # (3, 12, 25, 196, 64)
-                    past_qkv = new_cache_feature[fname]
+                    past_qkv = anchor_features[fname]
                     past_qkv = past_qkv.permute(0, 2, 1, 3, 4)  # (3, 12, 25, 196, 64)
 
                     dmap_channeled = dmap_window.expand(-1, -1, -1, qkv.shape[-1])   # (25, 14, 14, 64)
-                    dmap_channeled = dmap_channeled.reshape(dmap_channeled.shape[0], -1, dmap_channeled.shape[-1])  # (25, 196, 64)
-                    dmap_channeled = dmap_channeled.unsqueeze(0).unsqueeze(0)   # (1, 1, 25, 196, 64)
+                    dmap_channeled = dmap_channeled.reshape(1, 1, dmap_channeled.shape[0], -1, dmap_channeled.shape[-1])  # (1, 1, 25, 196, 64)
 
                     qkv = qkv * dmap_channeled + past_qkv * (1 - dmap_channeled)
+                    new_cache_feature[fname] = qkv.clone()
 
                     # reshape back
                     qkv = qkv.permute(0, 2, 1, 3, 4).reshape(3, 12, 25, 196, 64)
@@ -320,6 +328,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
                     dmap_channeled = dmap_channeled.reshape(1, 1, 1, -1, dmap_channeled.shape[-1])  # (1, 1, 1, 4096, 64)
 
                     qkv = qkv * dmap_channeled + anchor_features[fname] * (1 - dmap_channeled)
+                    new_cache_feature[fname] = qkv.clone()
 
             q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)  # q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
 
@@ -328,6 +337,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
             if block.attn.use_rel_pos:
                 attn = add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn))
 
+            # projection
             attn = attn.softmax(dim=-1)
             x_attn = (attn @ v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
             x_attn = block.attn.proj(x_attn)
@@ -340,17 +350,28 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
 
             # Residual
             x = shortcut + block.drop_path(x)
-            x = x + block.drop_path(block.mlp(block.norm2(x)))
 
-            if block.use_residual_block:
+            shortcut2 = x
+            x_norm2 = block.norm2(x)
+
+            x_mlp_out = partial_mlp_inference(
+                x_norm2,           # (B, H, W, C)
+                dmap_block,        # (B, H, W, 1)
+                block.mlp, 
+                block.drop_path
+            )
+            x = shortcut2 + x_mlp_out
+
+
+            if block.use_residual_block:    # nothing
                 x = self.residual(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
             
             fname = f"block{bidx}_out"
-            new_cache_feature[fname] = x.clone()
             if fname in anchor_features:
                 # x: (1, 64, 64, 768), anchor_features[fname]: (1, 64, 64, 768)
                 dmap_channeled = dmap_block.expand(-1, -1, -1, x.shape[-1])    # (1, 64, 64, 768)
                 x = x * dmap_channeled + anchor_features[fname] * (1 - dmap_channeled)
+            new_cache_feature[fname] = x.clone()
 
         # > FPN
         bottom_up_features = {net._out_features[0]: x.permute(0, 3, 1, 2)}

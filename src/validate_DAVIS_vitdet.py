@@ -167,6 +167,24 @@ def single_inference(
     else:
         dirtiness_map = create_dirtiness_map(anchor_padded_ndarray, target_padded_ndarray)
 
+        # staged inference
+        # randomly fill the dirtiness map with int 1 to num_stages
+        # then recompute the dirtiness map
+
+        # num_stages = 10
+        # stage_map = torch.randint(1, num_stages + 1, dirtiness_map.shape, device="cuda")
+
+        # cached_features_dict = anchor_features
+        # for stage in range(1, num_stages + 1):
+        #     # create a mask for the current stage
+        #     mask = (stage_map == stage).float()
+        #     now_dmap = dirtiness_map * mask
+
+        #     now_dmap_comprate = torch.mean(now_dmap).item()
+        #     print(f"{stage}: {now_dmap_comprate}")
+
+        #     (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(target_padded_ndarray, anchor_features=cached_features_dict, dirtiness_map=now_dmap)
+            
         (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(target_padded_ndarray, anchor_features=anchor_features, dirtiness_map=dirtiness_map)
         
         return (boxes_cont, labels_cont, scores_cont), {
@@ -205,7 +223,7 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
 
     refresh_anchor = True
 
-    pbar = tqdm(enumerate(image_names), total=len(image_names), leave=False)
+    pbar = tqdm(enumerate(image_names), total=len(image_names), leave=True)
     for idx, iname in pbar:
         basename = os.path.splitext(iname)[0]
 
@@ -306,7 +324,7 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
     # Make video of the results
     video_path = os.path.join(output_path, f"gop{gop}.mp4")
     os.system(f"ffmpeg -y -r 10 -i {output_path}/temp/%05d.jpg -c:v libx264 -vf fps=25 -pix_fmt yuv420p {video_path} > /dev/null 2>&1")
-    os.system(f"rm -rf {output_path}/temp")
+    # os.system(f"rm -rf {output_path}/temp")
 
     # avg_compute_rate, avg_iou_gt, avg_iou_full, inference_results
     avg_compute_rate = np.mean(recompute_rates)
@@ -327,8 +345,10 @@ def main():
     model.load_weight("./ipconv/models/model_final_61ccd1.pkl")
     model.eval()
 
-    sequence_names = sorted(os.listdir("/data/DAVIS/JPEGImages/480p"))
-    gops = [1, 6, 30, 100]
+    # sequence_names = sorted(os.listdir("/data/DAVIS/JPEGImages/480p"))
+    sequence_names = ["bear"]
+    # gops = [1, 6, 30, 100]
+    gops = [30]
 
     for sequence_name in sequence_names:
         recompute_rates = {}
