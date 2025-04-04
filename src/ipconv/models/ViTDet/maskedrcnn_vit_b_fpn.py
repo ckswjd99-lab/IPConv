@@ -341,7 +341,14 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
                 # projection
                 attn = attn.softmax(dim=-1)
                 x_attn = (attn @ v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
-                x_attn = block.attn.proj(x_attn)
+
+                x_attn_flat = x_attn.reshape(-1, x_attn.shape[-1])
+                x_attn_selected = x_attn_flat[dmap_now_flat == 1, :]
+                x_attn_selected = block.attn.proj(x_attn_selected)
+                x_attn = torch.zeros(B_attn * H_attn * W_attn, x_attn_selected.shape[-1], device=self.device)
+                x_attn[dmap_now_flat == 1, :] = x_attn_selected.view(-1, x_attn_selected.shape[-1])
+                x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
+
             else:
                 q_selected = q[:, dmap_now_flat == 1, :]
                 num_selected = q_selected.shape[1]
