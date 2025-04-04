@@ -281,7 +281,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
             x = block.norm1(x)
 
             # Window partition
-            dmap_block = dirtiness_map.clone() if bidx < 11 else torch.ones_like(dirtiness_map, device=self.device)
+            dmap_block = dirtiness_map.clone() if bidx < 12 else torch.ones_like(dirtiness_map, device=self.device)
             dmap_window = None
             if block.window_size > 0:
                 H, W = x.shape[1], x.shape[2]
@@ -332,16 +332,36 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
 
             q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)  # q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
 
-            attn = (q * block.attn.scale) @ k.transpose(-2, -1)
+            if bidx not in [2, 5, 8, 11]:
+                attn = (q * block.attn.scale) @ k.transpose(-2, -1)
 
-            if block.attn.use_rel_pos:
-                attn = add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn))
+                if block.attn.use_rel_pos:
+                    attn = add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn))
 
-            # projection
-            attn = attn.softmax(dim=-1)
-            x_attn = (attn @ v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
-            x_attn = block.attn.proj(x_attn)
-            
+                # projection
+                attn = attn.softmax(dim=-1)
+                x_attn = (attn @ v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
+                x_attn = block.attn.proj(x_attn)
+            else:
+                q_selected = q[:, dmap_now_flat == 1, :]
+                num_selected = q_selected.shape[1]
+
+                attn_selected = (q_selected * block.attn.scale) @ k.transpose(-2, -1)
+                attn = torch.zeros(B_attn * block.attn.num_heads, H_attn * W_attn, H_attn * W_attn, device=self.device)
+                attn[:, dmap_now_flat == 1, :] = attn_selected
+
+                if block.attn.use_rel_pos:
+                    attn = add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn))
+
+                # projection
+                attn_selected = attn[:, dmap_now_flat == 1, :].softmax(dim=-1)
+                x_attn_selected = (attn_selected @ v).view(B_attn, block.attn.num_heads, num_selected, -1).permute(0, 2, 1, 3).reshape(B_attn, num_selected, -1)
+                x_attn_selected = block.attn.proj(x_attn_selected)
+
+                x_attn = torch.zeros(B_attn, H_attn * W_attn, x_attn_selected.shape[-1], device=self.device)
+                x_attn[:, dmap_now_flat == 1, :] = x_attn_selected
+                x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
+
             x = x_attn
             
             # Reverse window partition

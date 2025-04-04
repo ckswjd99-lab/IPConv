@@ -347,8 +347,7 @@ def main():
 
     # sequence_names = sorted(os.listdir("/data/DAVIS/JPEGImages/480p"))
     sequence_names = ["bear"]
-    # gops = [1, 6, 30, 100]
-    gops = [30]
+    gops = [1, 6, 30, 100]
 
     for sequence_name in sequence_names:
         recompute_rates = {}
