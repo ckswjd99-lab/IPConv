@@ -155,13 +155,14 @@ def single_inference(
         # affine matrix: translation with shift_to_center
         target_scaled_ndarray = cv2.resize(target_ndarray, (int(target_ndarray.shape[1] * basic_scaling_factor), int(target_ndarray.shape[0] * basic_scaling_factor)), interpolation=cv2.INTER_LINEAR)
         shift_to_center = ((1024 - target_scaled_ndarray.shape[1]) // 2, (1024 - target_scaled_ndarray.shape[0]) // 2)
-        affine_matrix = np.array([[1, 0, shift_to_center[0]], [0, 1, shift_to_center[1]]], dtype=np.float32)
+        affine_matrix = np.array([[basic_scaling_factor, 0, shift_to_center[0]], [0, basic_scaling_factor, shift_to_center[1]]], dtype=np.float32)
 
         return (boxes_cont, labels_cont, scores_cont), {
             "affine_matrix": affine_matrix,
             "target_padded_ndarray": target_padded_ndarray,
             "dirtiness_map": torch.ones((1, 64, 64, 1), dtype=torch.float32, device="cuda"),
             "cached_features_dict": cached_features_dict,
+            "is_refreshed": refresh_anchor,
         }
     
     else:
@@ -192,6 +193,7 @@ def single_inference(
             "target_padded_ndarray": target_padded_ndarray,
             "dirtiness_map": dirtiness_map,
             "cached_features_dict": cached_features_dict,
+            "is_refreshed": refresh_anchor,
         }
     
 
@@ -279,14 +281,21 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
             target_padded_ndarray = intermediate_dict["target_padded_ndarray"]
             dirtiness_map = intermediate_dict["dirtiness_map"]
             cached_features_dict = intermediate_dict["cached_features_dict"]
+            is_refreshed = intermediate_dict["is_refreshed"]
 
-            # update padded anchor image
-            dmap_resized = cv2.resize(dirtiness_map[0, :, :, 0].cpu().numpy(), (target_padded_ndarray.shape[1], target_padded_ndarray.shape[0]), interpolation=cv2.INTER_NEAREST)
-            dmap_resized = np.stack([dmap_resized] * 3, axis=-1)
-            new_anchor_padded_ndarray = anchor_image_padded * (1 - dmap_resized) + target_padded_ndarray * dmap_resized
+            if not is_refreshed:
+                # update padded anchor image
+                dmap_resized = cv2.resize(dirtiness_map[0, :, :, 0].cpu().numpy(), (target_padded_ndarray.shape[1], target_padded_ndarray.shape[0]), interpolation=cv2.INTER_NEAREST)
+                dmap_resized = np.stack([dmap_resized] * 3, axis=-1)
+                new_anchor_padded_ndarray = anchor_image_padded * (1 - dmap_resized) + target_padded_ndarray * dmap_resized
 
-            anchor_image_padded = new_anchor_padded_ndarray.astype(np.uint8)
-            anchor_features = cached_features_dict
+                anchor_image_padded = new_anchor_padded_ndarray.astype(np.uint8)
+                anchor_features = cached_features_dict
+            else:
+                # update anchor image
+                anchor_image_padded = target_padded_ndarray
+                anchor_features = cached_features_dict
+
         
         # affine ground truth
         boxes_gt = affine_ground_truth_boxes(boxes_gt, affine_matrix)
