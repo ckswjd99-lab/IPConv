@@ -15,7 +15,7 @@ from tqdm import tqdm
 from typing import List, Optional, Dict, Tuple, Union
 
 from .modeling.backbone.vit import ViT, SimpleFeaturePyramid
-from .modeling.backbone.utils import get_abs_pos, window_partition, window_unpartition, add_decomposed_rel_pos, partial_mlp_inference
+from .modeling.backbone.utils import get_abs_pos, window_partition, window_unpartition, add_decomposed_rel_pos, partial_mlp_inference, expand_mask_neighbors
 from .modeling.backbone.fpn import LastLevelMaxPool, ShapeSpec
 
 from .modeling.meta_arch import GeneralizedRCNN
@@ -211,14 +211,14 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
         dirtiness_map = cv2.resize(dirtiness_map, (image_W // block_size, image_H // block_size), interpolation=cv2.INTER_LINEAR)
         dirtiness_map = (dirtiness_map > 0).astype(np.float32)
 
-        dirtiness_map = torch.from_numpy(dirtiness_map).to("cuda")
+        dirtiness_map = torch.from_numpy(dirtiness_map).to(self.device)
         dirtiness_map = dirtiness_map.unsqueeze(0).unsqueeze(-1)
 
         return dirtiness_map
 
     def forward(self, image_ndarray: np.ndarray):
         # image_ndarray: (H, W, C)
-        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
+        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8, device=self.device).permute(2, 0, 1)
         input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
         
         detections = self.base_model(input)
@@ -237,8 +237,8 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
             self, 
             image_ndarray: np.ndarray, 
             anchor_features: Dict[str, torch.Tensor] = {},
-            dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1).to("cuda"),
-        ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], Dict[str, torch.Tensor]]:
+            dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda"),
+    ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], Dict[str, torch.Tensor]]:
         # image_ndarray: (H, W, C)
 
         new_cache_feature = {}
@@ -281,7 +281,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
             x = block.norm1(x)
 
             # Window partition
-            dmap_block = dirtiness_map.clone() if bidx < 12 else torch.ones_like(dirtiness_map, device=self.device)
+            dmap_block = dirtiness_map.clone() if bidx < 11 else expand_mask_neighbors(dirtiness_map)
             dmap_window = None
             if block.window_size > 0:
                 H, W = x.shape[1], x.shape[2]
@@ -332,7 +332,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
 
             q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)  # q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
 
-            if bidx not in [2, 5, 8, 11]:
+            if bidx not in [2, 5, 8, 11]:   # window attention
                 attn = (q * block.attn.scale) @ k.transpose(-2, -1)
 
                 if block.attn.use_rel_pos:
@@ -349,7 +349,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
                 x_attn[dmap_now_flat == 1, :] = x_attn_selected.view(-1, x_attn_selected.shape[-1])
                 x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
 
-            else:
+            else:   # global attention
                 q_selected = q[:, dmap_now_flat == 1, :]
                 num_selected = q_selected.shape[1]
 
@@ -403,11 +403,100 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
         # > FPN
         bottom_up_features = {net._out_features[0]: x.permute(0, 3, 1, 2)}
 
-        features = bottom_up_features[backbone.in_feature]
-        results = []
+        features = bottom_up_features[backbone.in_feature]  # (1, 768, 64, 64)
+        # DEPRECATED: full computation
+        # results = []
+        # for stage in backbone.stages:
+        #     results.append(stage(features))
 
-        for stage in backbone.stages:
-            results.append(stage(features))
+        dmap_feat = expand_mask_neighbors(dirtiness_map).reshape(64, 64)    # (64, 64)
+
+        fname = "raw_features"
+        if fname in anchor_features:
+            past_feat = anchor_features[fname]
+            past_feat[:, :, dmap_feat == 1] = features[:, :, dmap_feat == 1]
+            features = past_feat
+        new_cache_feature[fname] = features.clone()
+
+        features_selected = features[:, :, dmap_feat == 1].unsqueeze(2)   # (1, 768, 1, num_selected)
+
+        stage_0 = backbone.stages[0]
+        stage_1 = backbone.stages[1]
+        stage_2 = backbone.stages[2]
+        stage_3 = backbone.stages[3]
+
+        # stage 0
+        # selective inference
+        feat_sel = features_selected.permute(3, 1, 2, 0)   # (num_selected, 768, 1, 1)
+        feat_sel = stage_0[0](feat_sel)   # (num_selected, 384, 2, 2)
+        feat_sel = stage_0[1](feat_sel)   # (num_selected, 384, 2, 2)
+        feat_sel = stage_0[2](feat_sel)   # (num_selected, 384, 2, 2)
+        feat_sel = stage_0[3](feat_sel)   # (num_selected, 192, 4, 4)
+        feat_sel = stage_0[4](feat_sel)   # (num_selected, 256, 4, 4)
+        
+        # caching and update
+        fname = "stage0_feat"
+        if fname in anchor_features:
+            feat_0 = anchor_features[fname]
+        else:
+            feat_0 = torch.zeros(64*64, 256, 4, 4, device=self.device)
+        feat_0[dmap_feat.view(-1) == 1, :, :, :] = feat_sel.view(-1, 256, 4, 4)
+        
+        new_cache_feature[fname] = feat_0.clone()
+
+        feat_0 = feat_0.view(1, 64, 64, 256, 4, 4).permute(0, 3, 1, 4, 2, 5)   # (1, 256, 64, 4, 64, 4)
+        feat_0 = feat_0.reshape(1, 256, 256, 256)
+
+        result_0 = feat_0
+        
+        # stage 1
+        # selective inference
+        feat_sel = features_selected.permute(3, 1, 2, 0)   # (num_selected, 768, 1, 1)
+        feat_sel = stage_1[0](feat_sel)   # (num_selected, 384, 2, 2)
+        feat_sel = stage_1[1](feat_sel)   # (num_selected, 256, 2, 2)
+
+        # caching and update
+        fname = "stage1_feat"
+        if fname in anchor_features:
+            feat_1 = anchor_features[fname]
+        else:
+            feat_1 = torch.zeros(64*64, 256, 2, 2, device=self.device)
+        feat_1[dmap_feat.view(-1) == 1, :, :, :] = feat_sel.view(-1, 256, 2, 2)
+        
+        new_cache_feature[fname] = feat_1.clone()
+
+        feat_1 = feat_1.view(1, 64, 64, 256, 2, 2).permute(0, 3, 1, 4, 2, 5)
+        feat_1 = feat_1.reshape(1, 256, 128, 128)
+        
+        feat_1 = stage_1[2](feat_1)
+
+        result_1 = feat_1
+
+        # stage 2
+        feat_sel = stage_2[0](features_selected)    # (1, 256, 1, num_selected)
+
+        fname = "stage2_feat"
+        if fname in anchor_features:
+            feat_2 = anchor_features[fname]   # (1, 256, 64, 64)
+            feat_2[:, :, dmap_feat == 1] = feat_sel.view(1, 256, -1)   # (1, 256, 1, num_selected)
+            feat_2 = feat_2.view(1, 256, 64, 64)
+        else:
+            feat_2 = feat_sel.view(1, 256, 64, 64)
+        
+        new_cache_feature[fname] = feat_2.clone()
+
+        feat_2 = stage_2[1](feat_2)
+
+        result_2 = feat_2
+        
+        # stage 3
+        feat = stage_3[0](features)
+        feat = stage_3[1](feat)
+        feat = stage_3[2](feat)
+
+        result_3 = feat
+
+        results = [result_0, result_1, result_2, result_3]
 
         if backbone.top_block is not None:
             if backbone.top_block.in_feature in bottom_up_features:
@@ -481,162 +570,3 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
         os.system(f"rm -rf {output_path}/temp")
         
         return avg_iou, inference_results
-
-    @torch.no_grad()
-    def validate_DAVIS(self, sequence_name, gop, data_root="/data/DAVIS", output_root="./output/maskedrcnn_vit_b_fpn", leave=False):
-        # DEPRECATED
-        
-        self.base_model.eval()
-
-        sequence_path = os.path.join(data_root, "JPEGImages/480p", sequence_name)
-        frames = sorted(os.listdir(sequence_path))
-
-        annotations_path = os.path.join(data_root, "Annotations_bbox/480p", f"{sequence_name}.json")
-        with open(annotations_path, "r") as f:
-            annotations = json.load(f)
-
-        output_path = os.path.join(output_root, "contexted_inference", sequence_name)
-        os.makedirs(output_path, exist_ok=True)
-        os.makedirs(os.path.join(output_path, "temp"), exist_ok=True)
-
-        anchor_image = None
-        anchor_image_padded = None
-        anchor_features_dict = None
-
-        compute_rates = []
-        inference_results = {}
-        IoU_gt_results = []
-        IoU_full_results = []
-
-        pbar = tqdm(range(len(frames)), leave=leave)
-        for i in pbar:
-            basename = os.path.splitext(frames[i])[0]
-            target_image = cv2.imread(os.path.join(sequence_path, frames[i]))
-            annotation = annotations.get(basename, [])  # List of bounding boxes, each box is in a format of {'x_min': 431, 'y_min': 230, 'x_max': 460, 'y_max': 260, 'label': '14'}
-
-            boxes_gt = [[float(box['x_min']), float(box['y_min']), float(box['x_max']), float(box['y_max'])] for box in annotation]
-            labels_gt = [-1 for box in annotation]
-            scores_gt = [1.0 for _ in annotation]
-
-            dirtiness_map_cache = None
-            force_recompute = False
-
-            shift_to_center = ((1024 - target_image.shape[1]) // 2, (1024 - target_image.shape[0]) // 2)
-            boxes_gt_shifted = [
-                [
-                    box[0] + shift_to_center[0], 
-                    box[1] + shift_to_center[1],
-                    box[2] + shift_to_center[0], 
-                    box[3] + shift_to_center[1]
-                ]
-            for box in boxes_gt]
-
-            if i % gop == 0 or force_recompute:
-                force_recompute = False
-
-                target_image_padded = np.zeros((1024, 1024, 3), dtype=np.uint8)
-                target_image_padded[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
-                target_image_padded[
-                    shift_to_center[1]:shift_to_center[1] + target_image.shape[0],
-                    shift_to_center[0]:shift_to_center[0] + target_image.shape[1]
-                ] = target_image
-
-                
-                (boxes, labels, scores), features = self.forward_contexted(target_image_padded)
-
-                anchor_image = target_image
-                anchor_image_padded = target_image_padded
-                anchor_features_dict = features
-
-                recompute_rate = 1
-
-                dirtiness_map_cache = np.ones_like(target_image_padded)
-            else:
-                aligned_image, shift_vector = refine_images(target_image, anchor_image)
-
-                shift_vector = (int(shift_vector[0]), int(shift_vector[1]))
-
-                # shift boxes_gt again
-                boxes_gt_shifted = [
-                    [
-                        box[0] + shift_to_center[0] + shift_vector[0], 
-                        box[1] + shift_to_center[1] + shift_vector[1],
-                        box[2] + shift_to_center[0] + shift_vector[0], 
-                        box[3] + shift_to_center[1] + shift_vector[1]
-                    ]
-                for box in boxes_gt]
-
-
-                target_image_padded = np.zeros((1024, 1024, 3), dtype=np.uint8)
-                target_image_padded[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
-                target_image_padded[
-                    shift_to_center[1] + shift_vector[1]:shift_to_center[1] + shift_vector[1] + target_image.shape[0],
-                    shift_to_center[0] + shift_vector[0]:shift_to_center[0] + shift_vector[0] + target_image.shape[1]
-                ] = target_image
-
-                if aligned_image is None:
-                    aligned_image = target_image
-                    anchor_features = {}
-                    dirtiness_map = torch.ones(1, 64, 64, 1).to("cuda")
-                else:
-                    dirtiness_map = self.create_dirtiness_map(anchor_image_padded, target_image_padded)
-
-                recompute_rate = torch.mean(dirtiness_map).item()
-
-                (boxes, labels, scores), _ = self.forward_contexted(target_image_padded, anchor_features=anchor_features_dict, image_tvec=shift_vector, dirtiness_map=dirtiness_map.clone())
-                inference_results[basename] = (boxes, labels, scores)
-
-                # dirtiness_map: (1, 64, 64, 1)
-                # make it into (1024, 1024)
-                dirtiness_map = dirtiness_map.squeeze(-1).unsqueeze(0)
-                dirtiness_map = torch.nn.functional.interpolate(dirtiness_map, size=target_image_padded.shape[:2], mode='nearest')
-                dirtiness_map = dirtiness_map.squeeze(0).squeeze(0).cpu().numpy()
-                dirtiness_map = np.stack([dirtiness_map] * 3, axis=-1)
-
-                # anchor_image_padded = (target_image * dirtiness_map + aligned_image * (1 - dirtiness_map)).astype(np.uint8)
-                # anchor_features_dict = features
-
-                dirtiness_map_cache = dirtiness_map
-
-            # Calculate IoU of the boxes
-            iou_gt = np.mean(calculate_multi_iou(boxes_gt_shifted, labels_gt, boxes, labels))
-            IoU_gt_results.append(iou_gt if iou_gt > 0 else 0.0)
-
-            iou_full = np.mean(calculate_multi_iou(boxes_gt_shifted, labels_gt, boxes, labels))
-            IoU_full_results.append(iou_full if iou_full > 0 else 0.0)
-
-            compute_rates.append(recompute_rate)
-            pbar.set_description(f"Processing {basename}, recomp: {recompute_rate:.4f}, IoU (gt): {np.mean(IoU_gt_results):.4f}, IoU (full): {iou_gt:.3f}")
-
-            # boost green channel of dirty area of the image
-            if dirtiness_map_cache is None:
-                dirtiness_map_cache = np.ones_like(target_image_padded)
-            if len(dirtiness_map_cache.shape) > 3:
-                dirtiness_map_cache = dirtiness_map_cache[0, ...]
-            target_image_padded = target_image_padded.astype(np.uint16)
-            target_image_padded[..., 1] = np.clip(target_image_padded[..., 1] + dirtiness_map_cache[..., 1] * 30, 0, 255)
-            target_image_padded = target_image_padded.astype(np.uint8)
-
-            image_bbox_gt = visualize_detection(target_image_padded, boxes_gt_shifted, labels_gt, scores_gt, colors=np.array([[0, 0, 255] for _ in range(len(self.COCO_LABELS_LIST))]), labels_list=self.COCO_LABELS_LIST)
-            image_bbox = visualize_detection(image_bbox_gt, boxes, labels, scores, labels_list=self.COCO_LABELS_LIST)
-            cv2.imwrite(os.path.join(output_path, "temp", f"{basename}.jpg"), image_bbox)
-
-        # statistics
-        avg_compute_rate = np.mean(compute_rates)
-        avg_iou_gt = np.mean(IoU_gt_results)
-        avg_iou_full = np.mean(IoU_full_results)
-
-        # save graph of recompute rate and IoU
-        graph_iou(IoU_gt_results, IoU_full_results, sequence_name, gop, output_path)
-        graph_recompute(compute_rates, sequence_name, gop, output_path)
-
-
-        # Make video of the results
-        video_path = os.path.join(output_root, f"contexted_inference/{sequence_name}", f"gop{gop}.mp4")
-        os.system(f"ffmpeg -y -r 10 -i {output_path}/temp/%05d.jpg -c:v libx264 -vf fps=25 -pix_fmt yuv420p {video_path} > /dev/null 2>&1")
-        os.system(f"rm -rf {output_path}/temp")
-
-
-        return avg_compute_rate, avg_iou_gt, avg_iou_full, inference_results
-
-                

@@ -192,31 +192,41 @@ def partial_mlp_inference(x, dmap, mlp_module, drop_path_fn=None):
     dmap: (B, H, W, 1), with values 0 or 1
     mlp_module: an MLP (FFN) module for f(x) (e.g., block.mlp)
     drop_path_fn: optional drop_path function (e.g., block.drop_path)
-    
+
     Returns:
         (B, H, W, C) where only positions with dmap=1 are updated by the MLP.
     """
     B, H, W, C = x.shape
     
-    # Reshape dmap to (B, H*W)
-    dmap_flat = dmap.view(B, -1)
-    # Reshape x to (B, H*W, C)
-    x_flat = x.view(B, -1, C)
+    x_flat = x.view(-1, C)  # shape: (N, C), where N = B*H*W
+
+    dmap_flat = dmap.view(-1)  # shape: (N,)
+
+    dirty_indices = torch.nonzero(dmap_flat, as_tuple=True)[0]  # shape: (D,)
+    if dirty_indices.numel() == 0:
+        return x
+
+    dirty_tokens = x_flat[dirty_indices, :]  # shape: (D, C)
+
+    updated_tokens = mlp_module(dirty_tokens)
+
+    if drop_path_fn is not None:
+        updated_tokens = drop_path_fn(updated_tokens)
+
+    x_flat[dirty_indices, :] = updated_tokens
+    x_updated = x_flat.view(B, H, W, C)
+
+    return x_updated
+
+
+
+def expand_mask_neighbors(mask_4d: torch.Tensor) -> torch.Tensor:
+    mask_4d = mask_4d.permute(0, 3, 1, 2)  # (1, 1, 64, 64)
+    kernel = torch.ones((1, 1, 3, 3), device=mask_4d.device, dtype=mask_4d.dtype)
     
-    for b in range(B):
-        dirty_indices = torch.nonzero(dmap_flat[b], as_tuple=True)[0]
-        if dirty_indices.numel() == 0:
-            continue
-        
-        dirty_tokens = x_flat[b, dirty_indices, :]
-        
-        updated_tokens = mlp_module(dirty_tokens)
-        
-        if drop_path_fn is not None:
-            updated_tokens = drop_path_fn(updated_tokens)
-        
-        x_flat[b, dirty_indices, :] = updated_tokens
+    expanded = F.conv2d(mask_4d, kernel, padding=1)
+    expanded = (expanded > 0).float()
+    expanded = expanded.permute(0, 2, 3, 1)
     
-    # Reshape back to (B, H, W, C)
-    x = x_flat.view(B, H, W, C)
-    return x
+    return expanded
+

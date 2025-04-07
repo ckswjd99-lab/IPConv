@@ -370,7 +370,11 @@ def main():
             recompute_rates[gop] = stat_dicts["recompute_rates"]
             iou_gt_results[gop] = stat_dicts["IoU_gt_results"]
         
-        log_text = f"{sequence_name}, {np.mean(recompute_rates[1])}, {np.mean(recompute_rates[6])}, {np.mean(recompute_rates[30])}, {np.mean(recompute_rates[100])}, {np.mean(iou_gt_results[1])}, {np.mean(iou_gt_results[6])}, {np.mean(iou_gt_results[30])}, {np.mean(iou_gt_results[100])}\n"
+        log_text = f"{sequence_name}, "
+        for gop in gops:
+            log_text += f"{np.mean(recompute_rates[gop])}, "
+            log_text += f"{np.mean(iou_gt_results[gop])}, "
+
 
         print(log_text)
         log_file.write(log_text)
