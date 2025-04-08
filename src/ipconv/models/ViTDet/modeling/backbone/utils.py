@@ -26,14 +26,18 @@ def window_partition(x, window_size):
     """
     B, H, W, C = x.shape
 
-    pad_h = (window_size - H % window_size) % window_size
-    pad_w = (window_size - W % window_size) % window_size
-    if pad_h > 0 or pad_w > 0:
-        x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
+    pad_h = (window_size - (H % window_size)) % window_size
+    pad_w = (window_size - (W % window_size)) % window_size
+
+    if pad_h or pad_w:
+        x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))  # (left, right, top, bottom, ...)
     Hp, Wp = H + pad_h, W + pad_w
 
-    x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
-    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    x = x.reshape(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
+    x = x.permute(0, 1, 3, 2, 4, 5)  # [B, num_h, num_w, window_size, window_size, C]
+
+    windows = x.reshape(-1, window_size, window_size, C)
+
     return windows, (Hp, Wp)
 
 
@@ -72,28 +76,38 @@ def get_rel_pos(q_size, k_size, rel_pos):
     Returns:
         Extracted positional embeddings according to relative positions.
     """
-    max_rel_dist = int(2 * max(q_size, k_size) - 1)
-    # Interpolate rel pos if needed.
+    max_rel_dist = 2 * max(q_size, k_size) - 1
+    
+    # Interpolate rel_pos only if necessary
     if rel_pos.shape[0] != max_rel_dist:
-        # Interpolate rel pos.
-        rel_pos_resized = F.interpolate(
-            rel_pos.reshape(1, rel_pos.shape[0], -1).permute(0, 2, 1),
+        # rel_pos (L, C) -> (1, C, L) -> interpolate -> (1, C, max_rel_dist) -> (max_rel_dist, C)
+        rel_pos = rel_pos.unsqueeze(0).permute(0, 2, 1)  # (1, C, L)
+        rel_pos = F.interpolate(
+            rel_pos,
             size=max_rel_dist,
             mode="linear",
+            align_corners=False
         )
-        rel_pos_resized = rel_pos_resized.reshape(-1, max_rel_dist).permute(1, 0)
+        rel_pos_resized = rel_pos.permute(0, 2, 1).squeeze(0)  # (max_rel_dist, C)
     else:
         rel_pos_resized = rel_pos
 
-    # Scale the coords with short length if shapes for q and k are different.
-    q_coords = torch.arange(q_size)[:, None] * max(k_size / q_size, 1.0)
-    k_coords = torch.arange(k_size)[None, :] * max(q_size / k_size, 1.0)
-    relative_coords = (q_coords - k_coords) + (k_size - 1) * max(q_size / k_size, 1.0)
+    # Compute relative coords
+    #    Possible caching if q_size, k_size are repeated
+    scale_factor = max(k_size / q_size, 1.0)
+    q_coords = torch.arange(q_size, dtype=torch.float32, device=rel_pos.device).mul_(scale_factor)
+    
+    scale_factor2 = max(q_size / k_size, 1.0)
+    k_coords = torch.arange(k_size, dtype=torch.float32, device=rel_pos.device).mul_(scale_factor2)
 
+    # int indexing => shift by (k_size - 1)*scale_factor2, then round
+    relative_coords = (q_coords[:, None] - k_coords[None, :]) + (k_size - 1) * scale_factor2
+
+    # Index into rel_pos_resized
     return rel_pos_resized[relative_coords.long()]
 
 
-def add_decomposed_rel_pos(attn, q, rel_pos_h, rel_pos_w, q_size, k_size):
+def add_decomposed_rel_pos(attn, q, rel_pos_h, rel_pos_w, q_size, k_size, dmap=None):
     """
     Calculate decomposed Relative Positional Embeddings from :paper:`mvitv2`.
     https://github.com/facebookresearch/mvit/blob/19786631e330df9f3622e5402b4a419a263a2c80/mvit/models/attention.py   # noqa B950
@@ -110,17 +124,48 @@ def add_decomposed_rel_pos(attn, q, rel_pos_h, rel_pos_w, q_size, k_size):
     """
     q_h, q_w = q_size
     k_h, k_w = k_size
-    Rh = get_rel_pos(q_h, k_h, rel_pos_h)
-    Rw = get_rel_pos(q_w, k_w, rel_pos_w)
+    
+    # get_rel_pos optimized
+    Rh = get_rel_pos(q_h, k_h, rel_pos_h)  # shape [q_h*k_h or max_rel_dist, C]
+    Rw = get_rel_pos(q_w, k_w, rel_pos_w)  # shape [q_w*k_w or max_rel_dist, C]
 
     B, _, dim = q.shape
-    r_q = q.reshape(B, q_h, q_w, dim)
-    rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
-    rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
+    # q: (B, q_h * q_w, dim) -> (B, q_h, q_w, dim)
+    q_4d = q.view(B, q_h, q_w, dim)
 
-    attn = (
-        attn.view(B, q_h, q_w, k_h, k_w) + rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]
-    ).view(B, q_h * q_w, k_h * k_w)
+    # rel_h: (B, q_h, q_w, k_h)
+    # rel_w: (B, q_h, q_w, k_w)
+    rel_h = torch.einsum("bhwc,hkc->bhwk", q_4d, Rh)
+    rel_w = torch.einsum("bhwc,wkc->bhwk", q_4d, Rw)
+    
+    # attn shape: (B, q_h*q_w, k_h*k_w)
+    if dmap is None:
+        attn_4d = attn.view(B, q_h * q_w, k_h, k_w)
+        rel_h = rel_h.reshape(B, q_h * q_w, k_h)
+        rel_w = rel_w.reshape(B, q_h * q_w, k_w)
+        attn_4d = attn_4d + rel_h[:, :, :, None] + rel_w[:, :, None, :]
+
+        # flatten back
+        attn = attn_4d.view(B, q_h * q_w, k_h * k_w)
+    else:
+        dmap_flat = dmap.view(-1)
+        dmap = dmap.reshape(q_h, q_w)
+
+        attn_4d = attn.reshape(B, q_h * q_w, k_h, k_w)
+        rel_h = rel_h.reshape(B, q_h * q_w, k_h)
+        rel_w = rel_w.reshape(B, q_h * q_w, k_w)
+
+        attn_4d_sel = attn_4d[:, dmap_flat == 1, :, :]
+        rel_h_sel = rel_h[:, dmap_flat == 1, :]
+        rel_w_sel = rel_w[:, dmap_flat == 1, :]
+        attn_4d_sel = attn_4d_sel + rel_h_sel[:, :, :, None] + rel_w_sel[:, :, None, :]
+        attn_4d_sel = attn_4d_sel.view(B, -1, k_h * k_w)
+
+        # broadcast
+        attn = torch.zeros(
+            B, q_h * q_w, k_h * k_w, device=attn.device, dtype=attn.dtype
+        )
+        attn[:, dmap_flat == 1, :] = attn_4d_sel
 
     return attn
 

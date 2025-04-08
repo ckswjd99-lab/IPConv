@@ -275,6 +275,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
             x = x * dmap_channeled + anchor_features[fname] * (1 - dmap_channeled)
         new_cache_feature[fname] = x.clone()    # (B, H, W, C)
 
+        dmap_window = None
         for bidx, block in enumerate(net.blocks):
             # > EncoderBlock
             shortcut = x
@@ -288,7 +289,8 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
                 x, pad_hw = window_partition(x, block.window_size)
                 # pad_hw = (70, 70)
                 # pad the dirtiness map and fill with 0
-                dmap_window, _ = window_partition(dmap_block, block.window_size)
+                if dmap_window is None:
+                    dmap_window, _ = window_partition(dmap_block, block.window_size)
 
             # Attention
             x_attn = x
@@ -332,6 +334,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
 
             q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)  # q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
 
+            # partial attention
             if bidx not in [2, 5, 8, 11]:   # window attention
                 attn = (q * block.attn.scale) @ k.transpose(-2, -1)
 
@@ -358,7 +361,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
                 attn[:, dmap_now_flat == 1, :] = attn_selected
 
                 if block.attn.use_rel_pos:
-                    attn = add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn))
+                    attn = add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn), dmap_now)
 
                 # projection
                 attn_selected = attn[:, dmap_now_flat == 1, :].softmax(dim=-1)
