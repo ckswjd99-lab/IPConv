@@ -269,11 +269,6 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
         
         # x: Tensor(1, 64, 64, 768)
         # dirtiness_map: Tensor(1, 64, 64, 1)
-        fname = "input_patched"
-        if fname in anchor_features:
-            dmap_channeled = dirtiness_map.expand(-1, -1, -1, x.shape[-1])
-            x = x * dmap_channeled + anchor_features[fname] * (1 - dmap_channeled)
-        new_cache_feature[fname] = x.clone()    # (B, H, W, C)
 
         dmap_window = None
         for bidx, block in enumerate(net.blocks):
@@ -282,7 +277,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
             x = block.norm1(x)
 
             # Window partition
-            dmap_block = dirtiness_map.clone() if bidx < 11 else expand_mask_neighbors(dirtiness_map)
+            dmap_block = dirtiness_map.clone() if bidx < 12 else expand_mask_neighbors(dirtiness_map)
             dmap_window = None
             if block.window_size > 0:
                 H, W = x.shape[1], x.shape[2]
@@ -308,29 +303,6 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
             qkv_flat[dmap_now_flat == 1, :] = qkv_selected
 
             qkv = qkv_flat.reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # qkv with shape (3, B_attn, nHead, H_attn * W_attn, C)
-
-            fname = f"block{bidx}_attn_qkv"
-            if fname in anchor_features:
-                if dmap_window is not None:
-                    qkv = qkv.permute(0, 2, 1, 3, 4)    # (3, 12, 25, 196, 64)
-                    past_qkv = anchor_features[fname]
-                    past_qkv = past_qkv.permute(0, 2, 1, 3, 4)  # (3, 12, 25, 196, 64)
-
-                    dmap_channeled = dmap_window.expand(-1, -1, -1, qkv.shape[-1])   # (25, 14, 14, 64)
-                    dmap_channeled = dmap_channeled.reshape(1, 1, dmap_channeled.shape[0], -1, dmap_channeled.shape[-1])  # (1, 1, 25, 196, 64)
-
-                    qkv = qkv * dmap_channeled + past_qkv * (1 - dmap_channeled)
-                    new_cache_feature[fname] = qkv.clone()
-
-                    # reshape back
-                    qkv = qkv.permute(0, 2, 1, 3, 4).reshape(3, 12, 25, 196, 64)
-                else:
-                    # QKV: (3, 1, 12, 4096, 64), dmap_block: (1, 64, 64, 1)
-                    dmap_channeled = dmap_block.expand(-1, -1, -1, qkv.shape[-1])    # (1, 64, 64, 64)
-                    dmap_channeled = dmap_channeled.reshape(1, 1, 1, -1, dmap_channeled.shape[-1])  # (1, 1, 1, 4096, 64)
-
-                    qkv = qkv * dmap_channeled + anchor_features[fname] * (1 - dmap_channeled)
-                    new_cache_feature[fname] = qkv.clone()
 
             q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)  # q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
 
@@ -407,99 +379,9 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
         bottom_up_features = {net._out_features[0]: x.permute(0, 3, 1, 2)}
 
         features = bottom_up_features[backbone.in_feature]  # (1, 768, 64, 64)
-        # DEPRECATED: full computation
-        # results = []
-        # for stage in backbone.stages:
-        #     results.append(stage(features))
-
-        dmap_feat = expand_mask_neighbors(dirtiness_map).reshape(64, 64)    # (64, 64)
-
-        fname = "raw_features"
-        if fname in anchor_features:
-            past_feat = anchor_features[fname]
-            past_feat[:, :, dmap_feat == 1] = features[:, :, dmap_feat == 1]
-            features = past_feat
-        new_cache_feature[fname] = features.clone()
-
-        features_selected = features[:, :, dmap_feat == 1].unsqueeze(2)   # (1, 768, 1, num_selected)
-
-        stage_0 = backbone.stages[0]
-        stage_1 = backbone.stages[1]
-        stage_2 = backbone.stages[2]
-        stage_3 = backbone.stages[3]
-
-        # stage 0
-        # selective inference
-        feat_sel = features_selected.permute(3, 1, 2, 0)   # (num_selected, 768, 1, 1)
-        feat_sel = stage_0[0](feat_sel)   # (num_selected, 384, 2, 2)
-        feat_sel = stage_0[1](feat_sel)   # (num_selected, 384, 2, 2)
-        feat_sel = stage_0[2](feat_sel)   # (num_selected, 384, 2, 2)
-        feat_sel = stage_0[3](feat_sel)   # (num_selected, 192, 4, 4)
-        feat_sel = stage_0[4](feat_sel)   # (num_selected, 256, 4, 4)
-        
-        # caching and update
-        fname = "stage0_feat"
-        if fname in anchor_features:
-            feat_0 = anchor_features[fname]
-        else:
-            feat_0 = torch.zeros(64*64, 256, 4, 4, device=self.device)
-        feat_0[dmap_feat.view(-1) == 1, :, :, :] = feat_sel.view(-1, 256, 4, 4)
-        
-        new_cache_feature[fname] = feat_0.clone()
-
-        feat_0 = feat_0.view(1, 64, 64, 256, 4, 4).permute(0, 3, 1, 4, 2, 5)   # (1, 256, 64, 4, 64, 4)
-        feat_0 = feat_0.reshape(1, 256, 256, 256)
-
-        result_0 = feat_0
-        
-        # stage 1
-        # selective inference
-        feat_sel = features_selected.permute(3, 1, 2, 0)   # (num_selected, 768, 1, 1)
-        feat_sel = stage_1[0](feat_sel)   # (num_selected, 384, 2, 2)
-        feat_sel = stage_1[1](feat_sel)   # (num_selected, 256, 2, 2)
-
-        # caching and update
-        fname = "stage1_feat"
-        if fname in anchor_features:
-            feat_1 = anchor_features[fname]
-        else:
-            feat_1 = torch.zeros(64*64, 256, 2, 2, device=self.device)
-        feat_1[dmap_feat.view(-1) == 1, :, :, :] = feat_sel.view(-1, 256, 2, 2)
-        
-        new_cache_feature[fname] = feat_1.clone()
-
-        feat_1 = feat_1.view(1, 64, 64, 256, 2, 2).permute(0, 3, 1, 4, 2, 5)
-        feat_1 = feat_1.reshape(1, 256, 128, 128)
-        
-        feat_1 = stage_1[2](feat_1)
-
-        result_1 = feat_1
-
-        # stage 2
-        feat_sel = stage_2[0](features_selected)    # (1, 256, 1, num_selected)
-
-        fname = "stage2_feat"
-        if fname in anchor_features:
-            feat_2 = anchor_features[fname]   # (1, 256, 64, 64)
-            feat_2[:, :, dmap_feat == 1] = feat_sel.view(1, 256, -1)   # (1, 256, 1, num_selected)
-            feat_2 = feat_2.view(1, 256, 64, 64)
-        else:
-            feat_2 = feat_sel.view(1, 256, 64, 64)
-        
-        new_cache_feature[fname] = feat_2.clone()
-
-        feat_2 = stage_2[1](feat_2)
-
-        result_2 = feat_2
-        
-        # stage 3
-        feat = stage_3[0](features)
-        feat = stage_3[1](feat)
-        feat = stage_3[2](feat)
-
-        result_3 = feat
-
-        results = [result_0, result_1, result_2, result_3]
+        results = []
+        for stage in backbone.stages:
+            results.append(stage(features))
 
         if backbone.top_block is not None:
             if backbone.top_block.in_feature in bottom_up_features:
@@ -510,9 +392,51 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
         assert len(backbone._out_features) == len(results)
         features = {f: res for f, res in zip(backbone._out_features, results)}
 
-        # inference: roi_heads
-        proposals, _ = self.base_model.proposal_generator(images, features, None)
-        results, _ = self.base_model.roi_heads(images, features, proposals, None)
+        # inference: RPN
+
+        # > proposal_generator
+        pgen = self.base_model.proposal_generator
+
+        pgen_features = [features[f] for f in pgen.in_features]
+        pgen_anchors = pgen.anchor_generator(pgen_features)
+
+        # pgen_logits, pgen_deltas = pgen.rpn_head(pgen_features) # 15 ms
+        pgen_logits = []
+        pgen_deltas = []
+        for feature in pgen_features:
+            h_start = int(feature.shape[2] * 0.0)
+            h_end = int(feature.shape[2] * 1.0)
+
+            x_sel = feature[:, :, h_start:h_end, :]
+
+            t_sel = pgen.rpn_head.conv(x_sel)
+
+            t = torch.zeros_like(feature)
+            t[:, :, h_start:h_end, :] = t_sel
+
+            logits = pgen.rpn_head.objectness_logits(t)
+            deltas = pgen.rpn_head.anchor_deltas(t)
+            
+            pgen_logits.append(logits.permute(0, 2, 3, 1).flatten(1))
+            pgen_deltas.append(
+                deltas.view(
+                    deltas.shape[0],
+                    -1,
+                    pgen.anchor_generator.box_dim,
+                    deltas.shape[-2],
+                    deltas.shape[-1]
+                )
+                .permute(0, 3, 4, 1, 2)
+                .flatten(1, -2)
+            )
+        ##
+
+        proposals = pgen.predict_proposals(
+            pgen_anchors, pgen_logits, pgen_deltas, images.image_sizes
+        )   # 7 ms
+
+        # > roi_heads
+        results, _ = self.base_model.roi_heads(images, features, proposals, None)   # 31 ms
 
         # postprocess
         detections = self.base_model._postprocess(results, input, images.image_sizes)
