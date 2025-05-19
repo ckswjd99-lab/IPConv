@@ -42,6 +42,7 @@ from ..proc_image import (
     graph_iou, graph_recompute
 )
 
+fidx = 0
 
 class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
     def __init__(self, device="cuda"):
@@ -238,13 +239,15 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
             image_ndarray: np.ndarray, 
             anchor_features: Dict[str, torch.Tensor] = {},
             dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda"),
+            only_backbone: bool = False,
     ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], Dict[str, torch.Tensor]]:
         # image_ndarray: (H, W, C)
 
         new_cache_feature = {}
         
         # convert to tensor
-        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
+        # image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
+        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device).half()
         input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
         
         # preprocess
@@ -277,7 +280,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
             x = block.norm1(x)
 
             # Window partition
-            dmap_block = dirtiness_map.clone() if bidx < 12 else expand_mask_neighbors(dirtiness_map)
+            dmap_block = dirtiness_map.clone() if bidx not in [] else expand_mask_neighbors(dirtiness_map)
             dmap_window = None
             if block.window_size > 0:
                 H, W = x.shape[1], x.shape[2]
@@ -299,7 +302,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
             x_attn_selected = x_attn_flat[dmap_now_flat == 1, :]
             qkv_selected = block.attn.qkv(x_attn_selected)
 
-            qkv_flat = torch.zeros(B_attn * H_attn * W_attn, 3 * 768, device=self.device)
+            qkv_flat = torch.zeros(B_attn * H_attn * W_attn, 3 * 768, device=self.device, dtype=x_attn.dtype)
             qkv_flat[dmap_now_flat == 1, :] = qkv_selected
 
             qkv = qkv_flat.reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # qkv with shape (3, B_attn, nHead, H_attn * W_attn, C)
@@ -320,7 +323,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
                 x_attn_flat = x_attn.reshape(-1, x_attn.shape[-1])
                 x_attn_selected = x_attn_flat[dmap_now_flat == 1, :]
                 x_attn_selected = block.attn.proj(x_attn_selected)
-                x_attn = torch.zeros(B_attn * H_attn * W_attn, x_attn_selected.shape[-1], device=self.device)
+                x_attn = torch.zeros(B_attn * H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=x_attn.dtype)
                 x_attn[dmap_now_flat == 1, :] = x_attn_selected.view(-1, x_attn_selected.shape[-1])
                 x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
 
@@ -329,7 +332,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
                 num_selected = q_selected.shape[1]
 
                 attn_selected = (q_selected * block.attn.scale) @ k.transpose(-2, -1)
-                attn = torch.zeros(B_attn * block.attn.num_heads, H_attn * W_attn, H_attn * W_attn, device=self.device)
+                attn = torch.zeros(B_attn * block.attn.num_heads, H_attn * W_attn, H_attn * W_attn, device=self.device, dtype=x_attn.dtype)
                 attn[:, dmap_now_flat == 1, :] = attn_selected
 
                 if block.attn.use_rel_pos:
@@ -340,7 +343,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
                 x_attn_selected = (attn_selected @ v).view(B_attn, block.attn.num_heads, num_selected, -1).permute(0, 2, 1, 3).reshape(B_attn, num_selected, -1)
                 x_attn_selected = block.attn.proj(x_attn_selected)
 
-                x_attn = torch.zeros(B_attn, H_attn * W_attn, x_attn_selected.shape[-1], device=self.device)
+                x_attn = torch.zeros(B_attn, H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=x_attn.dtype)
                 x_attn[:, dmap_now_flat == 1, :] = x_attn_selected
                 x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
 
@@ -375,6 +378,9 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
                 x = x * dmap_channeled + anchor_features[fname] * (1 - dmap_channeled)
             new_cache_feature[fname] = x.clone()
 
+        if only_backbone:
+            return ([], [], []), new_cache_feature
+
         # > FPN
         bottom_up_features = {net._out_features[0]: x.permute(0, 3, 1, 2)}
 
@@ -404,39 +410,35 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
         pgen_logits = []
         pgen_deltas = []
         for feature in pgen_features:
-            h_start = int(feature.shape[2] * 0.0)
-            h_end = int(feature.shape[2] * 1.0)
-
-            x_sel = feature[:, :, h_start:h_end, :]
-
-            t_sel = pgen.rpn_head.conv(x_sel)
-
-            t = torch.zeros_like(feature)
-            t[:, :, h_start:h_end, :] = t_sel
+            t = pgen.rpn_head.conv(feature)
 
             logits = pgen.rpn_head.objectness_logits(t)
             deltas = pgen.rpn_head.anchor_deltas(t)
-            
-            pgen_logits.append(logits.permute(0, 2, 3, 1).flatten(1))
-            pgen_deltas.append(
-                deltas.view(
-                    deltas.shape[0],
-                    -1,
-                    pgen.anchor_generator.box_dim,
-                    deltas.shape[-2],
-                    deltas.shape[-1]
-                )
-                .permute(0, 3, 4, 1, 2)
-                .flatten(1, -2)
+
+            pgen_logits.append(logits)
+            pgen_deltas.append(deltas)
+
+        pgen_logits = [logits.permute(0, 2, 3, 1).flatten(1) for logits in pgen_logits]
+        pgen_deltas = [
+            deltas.view(
+                deltas.shape[0],
+                -1,
+                pgen.anchor_generator.box_dim,
+                deltas.shape[-2],
+                deltas.shape[-1]
             )
-        ##
+            .permute(0, 3, 4, 1, 2)
+            .flatten(1, -2)
+            for deltas in pgen_deltas
+        ]
 
         proposals = pgen.predict_proposals(
             pgen_anchors, pgen_logits, pgen_deltas, images.image_sizes
-        )   # 7 ms
+        )
+        proposals = [proposals[0].to(self.device)]
 
         # > roi_heads
-        results, _ = self.base_model.roi_heads(images, features, proposals, None)   # 31 ms
+        results, _ = self.base_model.roi_heads(images, features, proposals, None)
 
         # postprocess
         detections = self.base_model._postprocess(results, input, images.image_sizes)
@@ -446,54 +448,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
         labels = predictions["instances"].pred_classes.cpu().numpy()
         scores = predictions["instances"].scores.cpu().numpy()
 
+        # boxes, labels, scores = [], [], []
+
         return (boxes, labels, scores), new_cache_feature
     
-    @torch.no_grad()
-    def validate_DAVIS_plain(self, sequence_name, data_root="/data/DAVIS", output_root="./output/maskedrcnn_vit_b_fpn", leave=False):
-        self.base_model.eval()
-
-        sequence_path = os.path.join(data_root, "JPEGImages/480p", sequence_name)
-        frames = sorted(os.listdir(sequence_path))
-
-        annotations_path = os.path.join(data_root, "Annotations_bbox/480p", f"{sequence_name}.json")
-        with open(annotations_path, "r") as f:
-            annotations = json.load(f)
-
-        output_path = os.path.join(output_root, "plain_inference", sequence_name)
-        os.makedirs(output_path, exist_ok=True)
-        os.makedirs(os.path.join(output_path, "temp"), exist_ok=True)
-
-        inference_results = {}
-        IoU_results = []
-
-        pbar = tqdm(range(len(frames)), leave=leave)
-        for i in pbar:
-            basename = os.path.splitext(frames[i])[0]
-            target_image = cv2.imread(os.path.join(sequence_path, frames[i]))
-            annotation = annotations.get(basename, [])  # List of bounding boxes, each box is in a format of {'x_min': 431, 'y_min': 230, 'x_max': 460, 'y_max': 260, 'label': '14'}
-
-            boxes_gt = [[float(box['x_min']), float(box['y_min']), float(box['x_max']), float(box['y_max'])] for box in annotation]
-            labels_gt = [-1 for box in annotation]
-            scores_gt = [1.0 for _ in annotation]
-
-            boxes_pred, labels_pred, scores_pred = self.forward(target_image)
-
-            inference_results[basename] = (boxes_pred, labels_pred, scores_pred)
-
-            ious = calculate_multi_iou(boxes_gt, labels_gt, boxes_pred, labels_pred)
-            iou = np.mean(ious) if len(ious) > 0 else 0.0
-            IoU_results.append(iou if not np.isnan(iou) else 0.0)
-
-            pbar.set_description(f"Processing {basename}, IoU: {iou:.4f}")
-
-            image_bbox_gt = visualize_detection(target_image, boxes_gt, labels_gt, scores_gt, colors=np.array([[0, 0, 255] for _ in range(len(self.COCO_LABELS_LIST))]), labels_list=self.COCO_LABELS_LIST)
-            image_bbox = visualize_detection(image_bbox_gt, boxes_pred, labels_pred, scores_pred, labels_list=self.COCO_LABELS_LIST)
-            cv2.imwrite(os.path.join(output_path, "temp", f"{basename}.jpg"), image_bbox)
-        
-        avg_iou = np.mean(IoU_results)
-
-        video_path = os.path.join(output_root, f"plain_inference/{sequence_name}", f"plain.mp4")
-        os.system(f"ffmpeg -y -r 10 -i {output_path}/temp/%05d.jpg -c:v libx264 -vf fps=25 -pix_fmt yuv420p {video_path} > /dev/null 2>&1")
-        os.system(f"rm -rf {output_path}/temp")
-        
-        return avg_iou, inference_results

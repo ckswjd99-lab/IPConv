@@ -5,19 +5,57 @@ import torch
 import json
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import time
 
-from typing import Dict, Tuple
+from torchvision.transforms import functional as F
+
+from typing import Dict, Tuple, List
 
 from ipconv.models import MaskedRCNN_ViT_B_FPN_Contexted
 from ipconv.models.proc_image import visualize_detection, calculate_multi_iou
 from ipconv.models.constants import COCO_LABELS_LIST
+from ipconv.models.ViTDet.modeling.backbone.utils import expand_mask_neighbors, shrink_mask_neighbors
+
+def create_sensitivity_map(
+    boxes: List[List[float]],  # List of bounding boxes, each box is in a format of [x_min, y_min, x_max, y_max]
+    scores: List[float],  # List of scores for each bounding box
+) -> np.ndarray:
+    # Create a blank sensitivity map
+    sensitivity_map = np.zeros((1024, 1024), dtype=np.float32)
+
+    # Iterate through each bounding box and its corresponding score
+    for box, score in zip(boxes, scores):
+        x_min, y_min, x_max, y_max = map(int, box)
+        # Create a mask for the current bounding box
+        mask = np.zeros((1024, 1024), dtype=np.float32)
+        mask[y_min:y_max, x_min:x_max] = score
+        # Add the mask to the sensitivity map
+        sensitivity_map += mask
+
+    # Expand the sensitivity map
+    sensitivity_map = cv2.GaussianBlur(sensitivity_map, (63, 63), 1.5) * 255 * 255
+
+
+    # Clip the sensitivity map to the range [0, 1]
+    # sensitivity_map = np.clip(sensitivity_map, 0, 1)
+
+    # Min-max normalization
+    min_val = np.min(sensitivity_map)
+    max_val = np.max(sensitivity_map)
+    if max_val - min_val > 0:
+        sensitivity_map = (sensitivity_map - min_val) / (max_val - min_val)
+    else:
+        sensitivity_map = np.zeros_like(sensitivity_map)
+
+    return sensitivity_map
 
 def create_dirtiness_map(
     anchor_image: np.ndarray, 
     current_image: np.ndarray,
     block_size: int = 16,
     dirty_thres: int = 30,
-    chromakey: np.ndarray = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
+    chromakey: np.ndarray = np.array([123.675, 116.28, 103.53], dtype=np.uint8),
+    sensi_map: np.ndarray = None,
 ) -> torch.Tensor:
     residual = cv2.absdiff(anchor_image, current_image)
     
@@ -29,8 +67,11 @@ def create_dirtiness_map(
 
     image_H, image_W = residual.shape[:2]
     
-    dirtiness_map = cv2.GaussianBlur(dirtiness_map, (7, 7), 1.5)
-    dirtiness_map = (dirtiness_map > dirty_thres).astype(np.float32)
+    dirtiness_map = cv2.GaussianBlur(dirtiness_map, (15, 15), 1.5)
+    if sensi_map is None:
+        dirtiness_map = (dirtiness_map > dirty_thres).astype(np.float32)
+    else:
+        dirtiness_map = (dirtiness_map > dirty_thres * (1 - sensi_map)).astype(np.float32)
 
     dirtiness_map = cv2.GaussianBlur(dirtiness_map, (15, 15), 1.5)
     dirtiness_map = cv2.resize(dirtiness_map, (image_W // block_size, image_H // block_size), interpolation=cv2.INTER_LINEAR)
@@ -38,6 +79,16 @@ def create_dirtiness_map(
 
     dirtiness_map = torch.from_numpy(dirtiness_map).to("cuda")
     dirtiness_map = dirtiness_map.unsqueeze(0).unsqueeze(-1)
+
+    # minimum recompute
+    maxnum = 10
+    while dirtiness_map.mean() < 0.1:
+
+        dirtiness_map = expand_mask_neighbors(dirtiness_map)
+
+        maxnum -= 1
+        if maxnum == 0:
+            break
 
     return dirtiness_map
 
@@ -75,7 +126,7 @@ def estimate_affine_in_padded_anchor(
 
     # Calculate Affine Transform
     # affine_matrix, mask = cv2.estimateAffine2D(src_pts, dst_pts, cv2.RANSAC, ransacReprojThreshold=3.0)
-    affine_matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, cv2.RANSAC, ransacReprojThreshold=10.0)
+    affine_matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, cv2.LMEDS, maxIters=5000, confidence=0.999, refineIters=10)
 
     return affine_matrix
 
@@ -132,7 +183,11 @@ def single_inference(
     anchor_features: Dict[str, torch.Tensor],
     basic_scaling_factor: float = 1.05,
     recompute_threshold: float = 0.4,
+    num_stages: int = 1,
+    sensi_map: np.ndarray = None,
 ):
+    # COMPRESSION PART must not included in latency
+    comp_start = time.time()
     affine_matrix = estimate_affine_in_padded_anchor(anchor_padded_ndarray, target_ndarray)
 
     target_padded_ndarray = apply_affine_and_pad(target_ndarray, affine_matrix)
@@ -150,6 +205,8 @@ def single_inference(
     # do jobs
     if refresh_anchor:
         target_padded_ndarray = get_padded_image(target_ndarray, (1024, 1024), basic_scaling_factor)
+        comp_end = time.time()
+
         (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(target_padded_ndarray)
         
         # affine matrix: translation with shift_to_center
@@ -163,30 +220,50 @@ def single_inference(
             "dirtiness_map": torch.ones((1, 64, 64, 1), dtype=torch.float32, device="cuda"),
             "cached_features_dict": cached_features_dict,
             "is_refreshed": refresh_anchor,
+            "comp_time": comp_end - comp_start,
         }
     
     else:
-        dirtiness_map = create_dirtiness_map(anchor_padded_ndarray, target_padded_ndarray)
+        dirtiness_map = create_dirtiness_map(anchor_padded_ndarray, target_padded_ndarray, sensi_map=sensi_map)
+        # dirtiness_map = torch.zeros_like(dirtiness_map, device="cuda")
+        # dirtiness_map[0, 0, 0, 0] = 1.0
+
+        num_stages = 1
+        stage_map = dirtiness_map
+
+        # stage map: expansion
+        # stage_map = shrink_mask_neighbors(dirtiness_map)
+        # stage_map += dirtiness_map
+
+        # stage map: random
+        # stage_map = torch.randint(1, num_stages + 1, dirtiness_map.shape, device="cuda")
+        
+
+        # stage map: sequential
+        # stage_map = torch.zeros(dirtiness_map.shape, device="cuda")
+        # for stage in range(1, num_stages + 1):
+        #     start_width = int((stage - 1) * dirtiness_map.shape[2] / num_stages)
+        #     end_width = int(stage * dirtiness_map.shape[2] / num_stages)
+        #     stage_map[:, :, start_width:end_width, :] = stage
+        comp_end = time.time()
 
         # staged inference
-        # randomly fill the dirtiness map with int 1 to num_stages
-        # then recompute the dirtiness map
+        cached_features_dict = anchor_features
+        for stage in range(1, num_stages + 1):
+            # create a mask for the current stage
+            # mask = (stage_map == stage).float()
+            # now_dmap = dirtiness_map * mask
+            now_dmap = (stage_map == stage).float()
 
-        # num_stages = 10
-        # stage_map = torch.randint(1, num_stages + 1, dirtiness_map.shape, device="cuda")
+            now_dmap_comprate = torch.mean(now_dmap).item()
 
-        # cached_features_dict = anchor_features
-        # for stage in range(1, num_stages + 1):
-        #     # create a mask for the current stage
-        #     mask = (stage_map == stage).float()
-        #     now_dmap = dirtiness_map * mask
+            if now_dmap_comprate == 0:
+                continue
 
-        #     now_dmap_comprate = torch.mean(now_dmap).item()
-        #     print(f"{stage}: {now_dmap_comprate}")
-
-        #     (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(target_padded_ndarray, anchor_features=cached_features_dict, dirtiness_map=now_dmap)
+            is_last_stage = (stage == num_stages)
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(target_padded_ndarray, anchor_features=cached_features_dict, dirtiness_map=now_dmap, only_backbone=not is_last_stage)
             
-        (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(target_padded_ndarray, anchor_features=anchor_features, dirtiness_map=dirtiness_map)
+        # (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(target_padded_ndarray, anchor_features=anchor_features, dirtiness_map=dirtiness_map)
         
         return (boxes_cont, labels_cont, scores_cont), {
             "affine_matrix": affine_matrix,
@@ -194,6 +271,7 @@ def single_inference(
             "dirtiness_map": dirtiness_map,
             "cached_features_dict": cached_features_dict,
             "is_refreshed": refresh_anchor,
+            "comp_time": comp_end - comp_start,
         }
     
 
@@ -222,9 +300,12 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
 
     anchor_image_padded = None
     anchor_features = None
+    sensi_map = None
 
     refresh_anchor = True
 
+    start_time = time.time()
+    uncounting_time = 0
     pbar = tqdm(enumerate(image_names), total=len(image_names), leave=True)
     for idx, iname in pbar:
         basename = os.path.splitext(iname)[0]
@@ -236,7 +317,10 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
         labels_gt = [-1 for box in annotation]
         scores_gt = [1.0 for _ in annotation]
 
+        load_start = time.time()
         current_image = cv2.imread(os.path.join(sequence_path, iname))
+        load_end = time.time()
+        uncounting_time += load_end - load_start
         
         # set scaling factor
         if current_image.shape[0] > fixed_image_size[0] or current_image.shape[1] > fixed_image_size[1]:
@@ -268,6 +352,8 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
             refresh_anchor = False
 
         else:
+            num_stages = 1
+
             (boxes_cont, labels_cont, scores_cont), intermediate_dict = single_inference(
                 model, 
                 anchor_image_padded, 
@@ -275,6 +361,8 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
                 anchor_features=anchor_features, 
                 recompute_threshold=recompute_threshold,
                 basic_scaling_factor=basic_scaling_factor,
+                num_stages=num_stages,
+                sensi_map=sensi_map,
             )
 
             affine_matrix = intermediate_dict["affine_matrix"]
@@ -282,6 +370,9 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
             dirtiness_map = intermediate_dict["dirtiness_map"]
             cached_features_dict = intermediate_dict["cached_features_dict"]
             is_refreshed = intermediate_dict["is_refreshed"]
+            comp_time = intermediate_dict["comp_time"]
+
+            uncounting_time += comp_time
 
             if not is_refreshed:
                 # update padded anchor image
@@ -296,7 +387,7 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
                 anchor_image_padded = target_padded_ndarray
                 anchor_features = cached_features_dict
 
-        
+        vis_start = time.time()
         # affine ground truth
         boxes_gt = affine_ground_truth_boxes(boxes_gt, affine_matrix)
 
@@ -315,24 +406,47 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
         # visualize
         dmap_resized = cv2.resize(dirtiness_map[0, :, :, 0].cpu().numpy(), (target_padded_ndarray.shape[1], target_padded_ndarray.shape[0]), interpolation=cv2.INTER_NEAREST)
 
-        target_padded_ndarray = target_padded_ndarray.astype(np.uint16)
-        target_padded_ndarray[:, :, 1] = np.clip(target_padded_ndarray[:, :, 1] + dmap_resized * 50, 0, 255)
-        target_padded_ndarray = target_padded_ndarray.astype(np.uint8)
+        vis_image = target_padded_ndarray.copy()
+        # vis_image = vis_image.astype(np.uint16)
+        # vis_image[:, :, 1] = np.clip(vis_image[:, :, 1] + dmap_resized * 50, 0, 255)
+        # vis_image = vis_image.astype(np.uint8)
 
-        vis_image = visualize_detection(target_padded_ndarray, boxes_gt, labels_gt, scores_gt, colors=np.array([[0, 0, 255] for _ in range(len(COCO_LABELS_LIST))]), labels_list=model.COCO_LABELS_LIST)
-        vis_image = visualize_detection(vis_image, boxes_cont, labels_cont, scores_cont, colors=np.array([[0, 255, 0] for _ in range(len(COCO_LABELS_LIST))]), labels_list=model.COCO_LABELS_LIST)
+        # vis_image = visualize_detection(vis_image, boxes_gt, labels_gt, scores_gt, threshold=0.1, colors=np.array([[0, 0, 255] for _ in range(len(COCO_LABELS_LIST))]), labels_list=model.COCO_LABELS_LIST)
+        # vis_image = visualize_detection(vis_image, boxes_cont, labels_cont, scores_cont, threshold=0.1, colors=np.array([[0, 255, 0] for _ in range(len(COCO_LABELS_LIST))]), labels_list=model.COCO_LABELS_LIST)
+
+        sensi_map = create_sensitivity_map(boxes_cont, scores_cont)
+        
 
         # write scaling factor at the left bottom corner
         cv2.putText(vis_image, f"Scale: {scaling_factor:.2f}", (10, 1014), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
         os.makedirs(os.path.join(output_path, "temp"), exist_ok=True)
         cv2.imwrite(os.path.join(output_path, "temp", f"{idx:05d}.jpg"), vis_image)
+        
+        # visualize sensitivity map
+        sensi_image = np.zeros((1024, 1024, 3), dtype=np.uint8)
+        sensi_image = sensi_image.astype(np.uint16)
+        sensi_image[:, :, 0] = np.clip(sensi_image[:, :, 0] + sensi_map * 255, 0, 255)
+        sensi_image = sensi_image.astype(np.uint8)
+
+        os.makedirs(os.path.join(output_path, "temp_sensi"), exist_ok=True)
+        cv2.imwrite(os.path.join(output_path, "temp_sensi", f"{idx:05d}.jpg"), sensi_image)
 
         pbar.set_description(f"Recompute rate: {recompute_rate:.2f}, IoU (GT): {np.mean(IoU_gt):.2f}")
+
+        vis_end = time.time()
+        uncounting_time += vis_end - vis_start
+    
+    pbar.close()
+    end_time = time.time()
+
+    num_iters = len(image_names)
+    elapsed_time = end_time - start_time - uncounting_time
+    throughput = num_iters / elapsed_time
     
     # Make video of the results
     video_path = os.path.join(output_path, f"gop{gop}.mp4")
-    os.system(f"ffmpeg -y -r 10 -i {output_path}/temp/%05d.jpg -c:v libx264 -vf fps=25 -pix_fmt yuv420p {video_path} > /dev/null 2>&1")
+    os.system(f"ffmpeg -y -r 10 -i {output_path}/temp/%05d.jpg -c:v libx264 -vf fps=30 -pix_fmt yuv420p {video_path} > /dev/null 2>&1")
     # os.system(f"rm -rf {output_path}/temp")
 
     # avg_compute_rate, avg_iou_gt, avg_iou_full, inference_results
@@ -342,6 +456,7 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
     return avg_compute_rate, avg_iou_gt, {
         "recompute_rates": recompute_rates,
         "IoU_gt_results": IoU_gt_results,
+        "throughput": throughput,
     }
 
 
@@ -355,29 +470,42 @@ def main():
     model.eval()
 
     # sequence_names = sorted(os.listdir("/data/DAVIS/JPEGImages/480p"))
+    # sequence_names = sequence_names[64:]
     sequence_names = ["bear"]
-    gops = [1, 6, 30, 100]
+    # gops = [1, 2, 3, 6, 30, 100]
+    gops = [1, 100]
+
+    log_text = "Sequence, "
+    for gop in gops:
+        log_text += f"gop{gop}_recompute_rate, "
+    for gop in gops:
+        log_text += f"gop{gop}_IoU_gt, "
+    for gop in gops:
+        log_text += f"gop{gop}_throughput, "
+    print(log_text)
 
     for sequence_name in sequence_names:
         recompute_rates = {}
         iou_gt_results = {}
+        throughputs = {}
 
         os.makedirs(f"{output_dir}/{sequence_name}", exist_ok=True)
-        log_file = open(f"{output_dir}/{sequence_name}/log.txt", "w")
 
         for gop in gops:
             avg_compute_rate, avg_iou_gt, stat_dicts = validate_DAVIS(model, sequence_name, gop, data_root, output_dir)
             recompute_rates[gop] = stat_dicts["recompute_rates"]
             iou_gt_results[gop] = stat_dicts["IoU_gt_results"]
+            throughputs[gop] = stat_dicts["throughput"]
         
         log_text = f"{sequence_name}, "
-        for gop in gops:
-            log_text += f"{np.mean(recompute_rates[gop])}, "
-            log_text += f"{np.mean(iou_gt_results[gop])}, "
-
+        for rrate in recompute_rates:
+            log_text += f"{np.mean(recompute_rates[rrate]):f}, "
+        for iou in iou_gt_results:
+            log_text += f"{np.mean(iou_gt_results[iou]):f}, "
+        for tput in throughputs:
+            log_text += f"{1000/throughputs[tput]:f}, "
 
         print(log_text)
-        log_file.write(log_text)
 
         # draw graphs
         # recompute rates
@@ -408,7 +536,20 @@ def main():
         plt.savefig(f"{output_dir}/{sequence_name}/iou_results.jpg")
         plt.close()
 
-    log_file.close()
+        # throughput
+        plt.figure(figsize=(10, 5))
+        plt.title(f"Image sequence: {sequence_name}", fontsize=20)
+        for gop in gops:
+            plt.plot(throughputs[gop], label=f"GOP={gop}")
+        plt.legend(fontsize=14)
+        plt.xlabel("Frame", fontsize=16)
+        plt.ylabel("Throughput (FPS)", fontsize=16)
+        plt.xticks(fontsize=14)
+        plt.yticks(fontsize=14)
+        plt.grid()
+        plt.savefig(f"{output_dir}/{sequence_name}/throughput.jpg")
+        plt.close()
+
 
 
 if __name__ == "__main__":

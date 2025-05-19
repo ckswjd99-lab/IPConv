@@ -275,3 +275,12 @@ def expand_mask_neighbors(mask_4d: torch.Tensor) -> torch.Tensor:
     
     return expanded
 
+def shrink_mask_neighbors(mask_4d: torch.Tensor) -> torch.Tensor:
+    mask_4d = mask_4d.permute(0, 3, 1, 2)  # (1, 1, 64, 64)
+    kernel = torch.ones((1, 1, 3, 3), device=mask_4d.device, dtype=mask_4d.dtype)
+    
+    shrunk = F.conv2d(mask_4d, kernel, padding=1)
+    shrunk = (shrunk == 9).float()
+    shrunk = shrunk.permute(0, 2, 3, 1)
+    
+    return shrunk
