@@ -805,3 +805,32 @@ def build_lwdetr_small():
     args = edict(build_args)
 
     return build(args)
+
+def build_lwdetr_xlarge():
+
+    build_args = get_default_args()
+
+    build_args['encoder'] = 'vit_base'
+    build_args['vit_encoder_num_layers'] = 10
+    build_args['window_block_indexes'] = [0, 1, 3, 6, 7, 9]
+    build_args['out_feature_indexes'] = [2, 4, 5, 9]
+    build_args['dec_layers'] = 3
+    build_args['group_detr'] = 13
+    build_args['two_stage'] = True
+    build_args['projector_scale'] = ['P3', 'P5']
+    build_args['hidden_dim'] = 384
+    build_args['sa_nheads'] = 12
+    build_args['ca_nheads'] = 24
+    build_args['dec_n_points'] = 4
+    build_args['bbox_reparam'] = True
+    build_args['lite_refpoint_refine'] = True
+    build_args['num_select'] = 300
+    build_args['weights'] = './ipconv/models/LW_DETR/LWDETR_xlarge_60e_coco.pth'
+    build_args['input'] = None  # Placeholder for input image path
+    build_args['output_dir'] = 'output/lwdetr_xlarge'
+    build_args['confidence_threshold'] = 0.5
+
+    from easydict import EasyDict as edict
+    args = edict(build_args)
+    
+    return build(args)

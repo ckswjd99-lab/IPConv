@@ -2,11 +2,12 @@ import torch
 from torchvision import transforms
 from PIL import Image, ImageDraw, ImageFont
 
-from ipconv.models.LW_DETR import build_lwdetr_small
+from ipconv.models.LW_DETR import build_lwdetr_small, build_lwdetr_xlarge
 from ipconv.models.LW_DETR.util.misc import nested_tensor_from_tensor_list
 from ipconv.models.LW_DETR.util.get_param_dicts import get_param_dict
 
-WEIHT_PATH = './ipconv/models/LW_DETR/LWDETR_small_60e_coco.pth'
+# WEIHT_PATH = './ipconv/models/LW_DETR/LWDETR_small_60e_coco.pth'
+WEIHT_PATH = './ipconv/models/LW_DETR/LWDETR_xlarge_60e_coco.pth'
 COCO_CLASSES = [
     '__background__', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
     'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'N/A', 'stop sign',
@@ -56,7 +57,8 @@ def visualize_detections(image, boxes, labels, scores, conf_thresh, output_path)
     image.save(output_path)
 
 def main():
-    model, _, postprocessors = build_lwdetr_small()
+    # model, _, postprocessors = build_lwdetr_small()
+    model, _, postprocessors = build_lwdetr_xlarge()
     model.eval()
     model = model.to(DEVICE)
 

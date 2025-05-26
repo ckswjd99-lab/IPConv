@@ -10,7 +10,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 # ------------------------------------------------------------------------
 
-from .lwdetr import build, build_lwdetr_small
+from .lwdetr import build, build_lwdetr_small, build_lwdetr_xlarge
 
 
 def build_model(args):
