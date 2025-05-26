@@ -171,7 +171,7 @@ class CascadeMaskRCNN_Swin_B_Contexted(nn.Module):
         self, 
         image_ndarray: np.ndarray,
         anchor_features: Dict[str, torch.Tensor] = {},
-        dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda"),
+        dirtiness_map: torch.Tensor = torch.ones(1, 256, 256, 1, device="cuda"),
         only_backbone: bool = False,
     ):
         new_cache_feature = {}
@@ -302,6 +302,8 @@ class CascadeMaskRCNN_Swin_B_Contexted(nn.Module):
                 H, W = H // 2, W // 2
                 C = C * 2
 
+        # return ([], [], []), new_cache_feature
+    
         # FPN forward
         results = []
         feature_map_to_stage = {'p0': '2', 'p1': '3', 'p2': '4', 'p3': '5'}  # Map feature names to stage numbers

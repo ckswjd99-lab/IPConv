@@ -52,7 +52,7 @@ def create_sensitivity_map(
 def create_dirtiness_map(
     anchor_image: np.ndarray, 
     current_image: np.ndarray,
-    block_size: int = 16,
+    block_size: int = 4,
     dirty_thres: int = 30,
     chromakey: np.ndarray = np.array([123.675, 116.28, 103.53], dtype=np.uint8),
     sensi_map: np.ndarray = None,
@@ -63,17 +63,19 @@ def create_dirtiness_map(
     # chromakey_mask = np.all(current_image == chromakey, axis=-1)
     # residual[chromakey_mask] = 0
 
+    blurring_size = (5, 5)
+
     dirtiness_map = cv2.cvtColor(residual, cv2.COLOR_BGR2GRAY)
 
     image_H, image_W = residual.shape[:2]
     
-    dirtiness_map = cv2.GaussianBlur(dirtiness_map, (15, 15), 1.5)
+    dirtiness_map = cv2.GaussianBlur(dirtiness_map, blurring_size, 1.5)
     if sensi_map is None:
         dirtiness_map = (dirtiness_map > dirty_thres).astype(np.float32)
     else:
         dirtiness_map = (dirtiness_map > dirty_thres * (1 - sensi_map)).astype(np.float32)
 
-    dirtiness_map = cv2.GaussianBlur(dirtiness_map, (15, 15), 1.5)
+    dirtiness_map = cv2.GaussianBlur(dirtiness_map, blurring_size, 1.5)
     dirtiness_map = cv2.resize(dirtiness_map, (image_W // block_size, image_H // block_size), interpolation=cv2.INTER_LINEAR)
     dirtiness_map = (dirtiness_map > 0).astype(np.float32)
 
@@ -81,14 +83,14 @@ def create_dirtiness_map(
     dirtiness_map = dirtiness_map.unsqueeze(0).unsqueeze(-1)
 
     # minimum recompute
-    maxnum = 10
-    while dirtiness_map.mean() < 0.1:
+    # maxnum = 10
+    # while dirtiness_map.mean() < 0.1:
 
-        dirtiness_map = expand_mask_neighbors(dirtiness_map)
+    #     dirtiness_map = expand_mask_neighbors(dirtiness_map)
 
-        maxnum -= 1
-        if maxnum == 0:
-            break
+    #     maxnum -= 1
+    #     if maxnum == 0:
+    #         break
 
     return dirtiness_map
 
@@ -217,7 +219,7 @@ def single_inference(
         return (boxes_cont, labels_cont, scores_cont), {
             "affine_matrix": affine_matrix,
             "target_padded_ndarray": target_padded_ndarray,
-            "dirtiness_map": torch.ones((1, 64, 64, 1), dtype=torch.float32, device="cuda"),
+            "dirtiness_map": torch.ones((1, 256, 256, 1), dtype=torch.float32, device="cuda"),
             "cached_features_dict": cached_features_dict,
             "is_refreshed": refresh_anchor,
             "comp_time": comp_end - comp_start,
@@ -343,7 +345,7 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
             
             # affine matrix: translation with shift_to_center and scale with scaling_factor
             affine_matrix = np.array([[scaling_factor, 0, shift_to_center[0]], [0, scaling_factor, shift_to_center[1]]], dtype=np.float32)
-            dirtiness_map = torch.ones((1, 64, 64, 1), dtype=torch.float32, device="cuda")
+            dirtiness_map = torch.ones((1, 256, 256, 1), dtype=torch.float32, device="cuda")
 
             target_padded_ndarray = current_image_padded
             anchor_image_padded = current_image_padded
@@ -362,7 +364,7 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
                 recompute_threshold=recompute_threshold,
                 basic_scaling_factor=basic_scaling_factor,
                 num_stages=num_stages,
-                sensi_map=sensi_map,
+                # sensi_map=sensi_map,
             )
 
             affine_matrix = intermediate_dict["affine_matrix"]
@@ -414,7 +416,7 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
         vis_image = visualize_detection(vis_image, boxes_gt, labels_gt, scores_gt, threshold=0.1, colors=np.array([[0, 0, 255] for _ in range(len(COCO_LABELS_LIST))]), labels_list=model.COCO_LABELS_LIST)
         vis_image = visualize_detection(vis_image, boxes_cont, labels_cont, scores_cont, threshold=0.1, colors=np.array([[0, 255, 0] for _ in range(len(COCO_LABELS_LIST))]), labels_list=model.COCO_LABELS_LIST)
 
-        sensi_map = create_sensitivity_map(boxes_cont, scores_cont)
+        # sensi_map = create_sensitivity_map(boxes_cont, scores_cont)
         
 
         # write scaling factor at the left bottom corner
@@ -424,13 +426,13 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
         cv2.imwrite(os.path.join(output_path, "temp", f"{idx:05d}.jpg"), vis_image)
         
         # visualize sensitivity map
-        sensi_image = np.zeros((1024, 1024, 3), dtype=np.uint8)
-        sensi_image = sensi_image.astype(np.uint16)
-        sensi_image[:, :, 0] = np.clip(sensi_image[:, :, 0] + sensi_map * 255, 0, 255)
-        sensi_image = sensi_image.astype(np.uint8)
+        # sensi_image = np.zeros((1024, 1024, 3), dtype=np.uint8)
+        # sensi_image = sensi_image.astype(np.uint16)
+        # sensi_image[:, :, 0] = np.clip(sensi_image[:, :, 0] + sensi_map * 255, 0, 255)
+        # sensi_image = sensi_image.astype(np.uint8)
 
-        os.makedirs(os.path.join(output_path, "temp_sensi"), exist_ok=True)
-        cv2.imwrite(os.path.join(output_path, "temp_sensi", f"{idx:05d}.jpg"), sensi_image)
+        # os.makedirs(os.path.join(output_path, "temp_sensi"), exist_ok=True)
+        # cv2.imwrite(os.path.join(output_path, "temp_sensi", f"{idx:05d}.jpg"), sensi_image)
 
         pbar.set_description(f"Recompute rate: {recompute_rate:.2f}, IoU (GT): {np.mean(IoU_gt):.2f}")
 
@@ -473,7 +475,7 @@ def main():
     # sequence_names = sequence_names[64:]
     sequence_names = ["bear"]
     # gops = [1, 2, 3, 6, 30, 100]
-    gops = [1, 100]
+    gops = [1]
 
     log_text = "Sequence, "
     for gop in gops:
