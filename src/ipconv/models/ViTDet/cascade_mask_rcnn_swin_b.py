@@ -243,6 +243,9 @@ class CascadeMaskRCNN_Swin_B_Contexted(nn.Module):
                 x = block.norm1(x)
                 x = x.view(B, H, W, C)
 
+                # size_shift = 5
+                # x[:, size_shift:, size_shift:, :] = x[:, :-size_shift, :-size_shift, :]  # Shift the feature map to match the window size
+
                 # pad feature maps to multiples of window size
                 pad_l = pad_t = 0
                 pad_r = (block.window_size - W % block.window_size) % block.window_size
@@ -330,8 +333,12 @@ class CascadeMaskRCNN_Swin_B_Contexted(nn.Module):
             
         features = {f: res for f, res in zip(backbone._out_features, results)}
 
+        # Detection head forward
+        proposals, _ = self.base_model.proposal_generator(images, features, None)
+        results, _ = self.base_model.roi_heads(images, features, proposals, None)
+        predictions = GeneralizedRCNN._postprocess(results, input, images.image_sizes)
+
         # Process predictions
-        predictions = self.base_model([{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}])
         boxes = predictions[0]["instances"].pred_boxes.tensor.cpu().numpy()
         labels = predictions[0]["instances"].pred_classes.cpu().numpy()
         scores = predictions[0]["instances"].scores.cpu().numpy()
