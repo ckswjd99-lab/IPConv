@@ -1,2 +1,3 @@
 from .fasterrcnn_resnet50_fpn import FasterRCNN_ResNet50_FPN_Contexted
 from .ViTDet.maskedrcnn_vit_b_fpn import MaskedRCNN_ViT_B_FPN_Contexted
+from .ViTDet.cascade_mask_rcnn_swin_b import CascadeMaskRCNN_Swin_B_Contexted
