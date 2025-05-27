@@ -5,7 +5,7 @@ from .structures.image_list import ImageList
 
 from .modeling.backbone import (SwinTransformer, FPN)
 from .modeling.backbone.fpn import LastLevelMaxPool, ShapeSpec
-from .modeling.backbone.utils import get_abs_pos, window_partition, window_unpartition, add_decomposed_rel_pos
+from .modeling.backbone.utils import get_abs_pos, window_partition, window_unpartition, add_decomposed_rel_pos, window_reverse
 from .modeling.meta_arch import GeneralizedRCNN
 from .modeling.proposal_generator import RPN, StandardRPNHead
 from .modeling.anchor_generator import DefaultAnchorGenerator
@@ -22,6 +22,7 @@ from .modeling.roi_heads import (
 
 import pickle
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 
 from typing import Dict
 
@@ -178,78 +179,78 @@ class CascadeMaskRCNN_Swin_B_Contexted(nn.Module):
 
         # convert to tensor
         image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device).half()
-        input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
+        batched_inputs = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
+
+        # Preprocess image
+        base_model = self.base_model
+        images = base_model.preprocess_image(batched_inputs)
         
-        # preprocess
-        images = [self.base_model._move_to_current_device(x["image"]) for x in input]
-        images = [(x - self.base_model.pixel_mean) / self.base_model.pixel_std for x in images]
-        images = ImageList.from_tensors(
-            images,
-            self.base_model.backbone.size_divisibility,
-            padding_constraints=self.base_model.backbone.padding_constraints,
-        )
+        # Backbone
+        backbone = base_model.backbone
+        swin_model = backbone.bottom_up
+        x = images.tensor
+        
+        x = swin_model.patch_embed(x)
 
-        # inference: backbone
-        backbone = self.base_model.backbone
-        net = backbone.bottom_up
+        Wh, Ww = x.size(2), x.size(3)
+        if swin_model.ape:
+            # interpolate the position embedding to the corresponding size
+            absolute_pos_embed = F.interpolate(
+                swin_model.absolute_pos_embed, size=(Wh, Ww), mode="bicubic"
+            )
+            x = (x + absolute_pos_embed).flatten(2).transpose(1, 2)  # B Wh*Ww C
+        else:
+            x = x.flatten(2).transpose(1, 2)
+        x = swin_model.pos_drop(x)
 
-        # Swin forward
-        x = net.patch_embed(images.tensor)  # B, C, H, W -> B, embed_dim, H/4, W/4
-        B, C, H, W = x.shape
-        x = x.permute(0, 2, 3, 1)  # B, H, W, C
-        x = x.reshape(B, H * W, C)  # Convert to BLC format
+        outs = {}
+        for i in range(swin_model.num_layers):
+            # Swin Transformer Layer
+            layer = swin_model.layers[i]
+            LH, LW = Wh, Ww
 
-        if net.ape:
-            x = x + net.absolute_pos_embed
-        x = net.pos_drop(x)
-
-        # Store intermediate features for FPN
-        features = {}
-        stage_idx = 0
-
-        # Process through Swin layers
-        for i, layer in enumerate(net.layers):
-            # Calculate attention mask for SW-MSA
-            window_size = layer.window_size
-            shift_size = layer.shift_size
-            H_pad = H + (window_size - H % window_size) % window_size
-            W_pad = W + (window_size - W % window_size) % window_size
-            img_mask = torch.zeros((1, H_pad, W_pad, 1), device=x.device)
-            h_slices = (slice(0, -window_size),
-                       slice(-window_size, -shift_size),
-                       slice(-shift_size, None))
-            w_slices = (slice(0, -window_size),
-                       slice(-window_size, -shift_size),
-                       slice(-shift_size, None))
+            Hp = int(np.ceil(LH / layer.window_size)) * layer.window_size
+            Wp = int(np.ceil(LW / layer.window_size)) * layer.window_size
+            img_mask = torch.zeros((1, Hp, Wp, 1), device=x.device)  # 1 Hp Wp 1
+            h_slices = (
+                slice(0, -layer.window_size),
+                slice(-layer.window_size, -layer.shift_size),
+                slice(-layer.shift_size, None),
+            )
+            w_slices = (
+                slice(0, -layer.window_size),
+                slice(-layer.window_size, -layer.shift_size),
+                slice(-layer.shift_size, None),
+            )
             cnt = 0
             for h in h_slices:
                 for w in w_slices:
                     img_mask[:, h, w, :] = cnt
                     cnt += 1
-            mask_windows, pad_hw = window_partition(img_mask, window_size)
-            mask_windows = mask_windows.view(-1, window_size * window_size)
-            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
 
-            # Process blocks in the layer
-            for block in layer.blocks:
-                block.H, block.W = H, W
-                #x = block(x, attn_mask)  # x is in BLC format
-                
-                B, L, C = x.shape
-                H, W = block.H, block.W
-                assert L == H * W, "input feature has wrong size"
+            mask_windows, _ = window_partition(
+                img_mask, layer.window_size
+            )  # nW, window_size, window_size, 1
+            mask_windows = mask_windows.view(-1, layer.window_size * layer.window_size)
+            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(
+                attn_mask == 0, float(0.0)
+            )
+
+            for bidx, block in enumerate(layer.blocks):
+                # Swin Transformer Block
+                block.H, block.W = LH, LW
+                Block_B, Block_L, Block_C = x.shape
+                Block_H, Block_W = block.H, block.W
+
                 shortcut = x
                 x = block.norm1(x)
-                x = x.view(B, H, W, C)
-
-                # size_shift = 5
-                # x[:, size_shift:, size_shift:, :] = x[:, :-size_shift, :-size_shift, :]  # Shift the feature map to match the window size
+                x = x.view(Block_B, Block_H, Block_W, Block_C)
 
                 # pad feature maps to multiples of window size
                 pad_l = pad_t = 0
-                pad_r = (block.window_size - W % block.window_size) % block.window_size
-                pad_b = (block.window_size - H % block.window_size) % block.window_size
+                pad_r = (block.window_size - Block_W % block.window_size) % block.window_size
+                pad_b = (block.window_size - Block_H % block.window_size) % block.window_size
                 x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b))
                 _, Hp, Wp, _ = x.shape
 
@@ -262,15 +263,54 @@ class CascadeMaskRCNN_Swin_B_Contexted(nn.Module):
                     attn_mask = None
 
                 # partition windows
-                x_windows, pad_hw = window_partition(shifted_x, block.window_size)  # nW*B, window_size, window_size, C
-                x_windows = x_windows.view(-1, block.window_size * block.window_size, C)  # nW*B, window_size*window_size, C
+                x_windows, _ = window_partition(
+                    shifted_x, block.window_size
+                )  # nW*B, window_size, window_size, C
+                x_windows = x_windows.view(
+                    -1, block.window_size * block.window_size, Block_C
+                )  # nW*B, window_size*window_size, C
 
                 # W-MSA/SW-MSA
-                attn_windows = block.attn(x_windows, mask=attn_mask)  # nW*B, window_size*window_size, C
+                ATTN_B_, ATTN_N, ATTN_C = x_windows.shape
+                qkv = (
+                    block.attn.qkv(x_windows)
+                    .reshape(ATTN_B_, ATTN_N, 3, block.attn.num_heads, ATTN_C // block.attn.num_heads)
+                    .permute(2, 0, 3, 1, 4)
+                )
+                q, k, v = qkv[0], qkv[1], qkv[2]
+
+                q = q * block.attn.scale
+                attn = q @ k.transpose(-2, -1)
+
+                relative_position_bias = block.attn.relative_position_bias_table[
+                    block.attn.relative_position_index.view(-1)
+                ].view(
+                    block.attn.window_size[0] * block.attn.window_size[1], block.attn.window_size[0] * block.attn.window_size[1], -1
+                )  # Wh*Ww,Wh*Ww,nH
+                relative_position_bias = relative_position_bias.permute(
+                    2, 0, 1
+                ).contiguous()  # nH, Wh*Ww, Wh*Ww
+                attn = attn + relative_position_bias.unsqueeze(0)
+
+                if attn_mask is not None:
+                    nW = attn_mask.shape[0]
+                    attn = attn.view(ATTN_B_ // nW, nW, block.attn.num_heads, ATTN_N, ATTN_N) + attn_mask.unsqueeze(1).unsqueeze(0)
+                    attn = attn.view(-1, block.attn.num_heads, ATTN_N, ATTN_N)
+                    attn = block.attn.softmax(attn)
+                else:
+                    attn = block.attn.softmax(attn)
+
+                attn = block.attn.attn_drop(attn)
+
+                x_windows = (attn @ v).transpose(1, 2).reshape(ATTN_B_, ATTN_N, ATTN_C)
+                x_windows = block.attn.proj(x_windows)
+                x_windows = block.attn.proj_drop(x_windows)
+
+                attn_windows = x_windows
 
                 # merge windows
-                attn_windows = attn_windows.view(-1, block.window_size, block.window_size, C)
-                shifted_x = window_unpartition(attn_windows, block.window_size, pad_hw, (H, W))  # B H' W' C
+                attn_windows = attn_windows.view(-1, block.window_size, block.window_size, Block_C)
+                shifted_x = window_reverse(attn_windows, block.window_size, Hp, Wp)  # B H' W' C
 
                 # reverse cyclic shift
                 if block.shift_size > 0:
@@ -279,64 +319,65 @@ class CascadeMaskRCNN_Swin_B_Contexted(nn.Module):
                     x = shifted_x
 
                 if pad_r > 0 or pad_b > 0:
-                    x = x[:, :H, :W, :].contiguous()
+                    x = x[:, :Block_H, :Block_W, :].contiguous()
 
-                x = x.view(B, H * W, C)
+                x = x.view(Block_B, Block_H * Block_W, Block_C)
 
                 # FFN
                 x = shortcut + block.drop_path(x)
                 x = x + block.drop_path(block.mlp(block.norm2(x)))
-
-            # Apply stage normalization and store features
-            if hasattr(net, f'norm{stage_idx}'):
-                norm = getattr(net, f'norm{stage_idx}')
-                x_out = norm(x)  # x_out is in BLC format
-                
-                # Convert to BCHW format for FPN
-                expected_channels = self.base_model.backbone.bottom_up.num_features[stage_idx]
-                out = x_out.view(B, H, W, expected_channels).permute(0, 3, 1, 2).contiguous()
-                features[f'p{stage_idx}'] = out
-                stage_idx += 1
-
-            # Apply downsample if exists
+            
             if layer.downsample is not None:
-                # Keep in BLC format for downsample
-                x = layer.downsample(x, H, W)
-                H, W = H // 2, W // 2
-                C = C * 2
+                x_down = layer.downsample(x, LH, LW)
+                Wh, Ww = (LH + 1) // 2, (LW + 1) // 2
+                x_out, H, W, x, Wh, Ww = x, LH, LW, x_down, Wh, Ww
+            else:
+                x_out, H, W, x, Wh, Ww = x, LH, LW, x, LH, LW
 
-        # return ([], [], []), new_cache_feature
-    
-        # FPN forward
+            if i in swin_model.out_indices:
+                norm_layer = getattr(swin_model, f"norm{i}")
+                x_out = norm_layer(x_out)
+
+                out = x_out.view(-1, H, W, swin_model.num_features[i]).permute(0, 3, 1, 2).contiguous()
+                outs["p{}".format(i)] = out
+
+        bottom_up_features = outs
+
+        # FPN
         results = []
-        feature_map_to_stage = {'p0': '2', 'p1': '3', 'p2': '4', 'p3': '5'}  # Map feature names to stage numbers
-        
-        for f in backbone.in_features:
-            if f in features:
-                x = features[f]  # Already in BCHW format
-                stage_num = feature_map_to_stage[f]
-                
-                # Apply lateral connection (1x1 conv)
-                lateral = getattr(backbone, f'fpn_lateral{stage_num}')(x)
-                
-                # Apply output conv (3x3 conv)
-                out = getattr(backbone, f'fpn_output{stage_num}')(lateral)
-                results.append(out)
+        prev_features = backbone.lateral_convs[0](bottom_up_features[backbone.in_features[-1]])
+        results.append(backbone.output_convs[0](prev_features))
 
-        # Apply top block if exists
+        ## reverse feature maps into top-down order (from low to high resolution)
+        for idx, (lateral_conv, output_conv) in enumerate(
+            zip(backbone.lateral_convs, backbone.output_convs)
+        ):
+            ## Slicing of ModuleList is not supported https://github.com/pytorch/pytorch/issues/47336
+            ## Therefore we loop over all modules but skip the first one
+            if idx > 0:
+                features = backbone.in_features[-idx - 1]
+                features = bottom_up_features[features]
+                top_down_features = F.interpolate(prev_features, scale_factor=2.0, mode="nearest")
+                lateral_features = lateral_conv(features)
+                prev_features = lateral_features + top_down_features
+                if backbone._fuse_type == "avg":
+                    prev_features /= 2
+                results.insert(0, output_conv(prev_features))
+
         if backbone.top_block is not None:
-            if backbone.top_block.in_feature in features:
-                top_block_in_feature = features[backbone.top_block.in_feature]
+            if backbone.top_block.in_feature in bottom_up_features:
+                top_block_in_feature = bottom_up_features[backbone.top_block.in_feature]
             else:
                 top_block_in_feature = results[backbone._out_features.index(backbone.top_block.in_feature)]
             results.extend(backbone.top_block(top_block_in_feature))
-            
+        
         features = {f: res for f, res in zip(backbone._out_features, results)}
+        
+        # Post-process features
+        proposals, _ = base_model.proposal_generator(images, features, None)
+        results, _ = base_model.roi_heads(images, features, proposals, None)
 
-        # Detection head forward
-        proposals, _ = self.base_model.proposal_generator(images, features, None)
-        results, _ = self.base_model.roi_heads(images, features, proposals, None)
-        predictions = GeneralizedRCNN._postprocess(results, input, images.image_sizes)
+        predictions = GeneralizedRCNN._postprocess(results, batched_inputs, images.image_sizes)
 
         # Process predictions
         boxes = predictions[0]["instances"].pred_boxes.tensor.cpu().numpy()
