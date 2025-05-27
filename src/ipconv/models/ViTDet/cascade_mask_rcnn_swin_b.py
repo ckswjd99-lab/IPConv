@@ -193,14 +193,9 @@ class CascadeMaskRCNN_Swin_B_Contexted(nn.Module):
         x = swin_model.patch_embed(x)
 
         Wh, Ww = x.size(2), x.size(3)
-        if swin_model.ape:
-            # interpolate the position embedding to the corresponding size
-            absolute_pos_embed = F.interpolate(
-                swin_model.absolute_pos_embed, size=(Wh, Ww), mode="bicubic"
-            )
-            x = (x + absolute_pos_embed).flatten(2).transpose(1, 2)  # B Wh*Ww C
-        else:
-            x = x.flatten(2).transpose(1, 2)
+
+        ## projection without APE
+        x = x.flatten(2).transpose(1, 2)
         x = swin_model.pos_drop(x)
 
         outs = {}
@@ -208,6 +203,10 @@ class CascadeMaskRCNN_Swin_B_Contexted(nn.Module):
             # Swin Transformer Layer
             layer = swin_model.layers[i]
             LH, LW = Wh, Ww
+            
+            ## downsample the dirtiness map to the current layer's feature map size
+            dmap_layer = F.interpolate(dirtiness_map, size=(LH, LW), mode="area")
+            dmap_layer = (dmap_layer > 0).float()
 
             Hp = int(np.ceil(LH / layer.window_size)) * layer.window_size
             Wp = int(np.ceil(LW / layer.window_size)) * layer.window_size
@@ -383,5 +382,7 @@ class CascadeMaskRCNN_Swin_B_Contexted(nn.Module):
         boxes = predictions[0]["instances"].pred_boxes.tensor.cpu().numpy()
         labels = predictions[0]["instances"].pred_classes.cpu().numpy()
         scores = predictions[0]["instances"].scores.cpu().numpy()
+
+        boxes[:, :] -= 128
 
         return (boxes, labels, scores), new_cache_feature

@@ -22,7 +22,7 @@ COCO_CLASSES = [
     'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'N/A', 'book',
     'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
 ]
-INPUT_PATH = '00000.jpg'
+INPUT_PATH = '000000496954.jpg'
 OUTPUT_PATH = 'output.jpg'
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 

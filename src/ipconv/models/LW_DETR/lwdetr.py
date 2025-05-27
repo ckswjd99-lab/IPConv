@@ -171,10 +171,6 @@ class LWDETR(nn.Module):
                 cls_enc.append(cls_enc_gidx)
             cls_enc = torch.cat(cls_enc, dim=1)
             out['enc_outputs'] = {'pred_logits': cls_enc, 'pred_boxes': ref_enc}
-        print('out', out.keys())
-        print('out pred_logits', out['pred_logits'].shape)
-        print('out pred_boxes', out['pred_boxes'].shape)
-        print('out enc_outputs', out.get('enc_outputs', {}).keys())
         return out
 
     def forward_export(self, tensors):
@@ -622,106 +618,6 @@ def build(args):
 
     return model, criterion, postprocessors
 
-
-def get_args_parser():
-    parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
-    # Model parameters
-    parser.add_argument('--weights', type=str, default=None, required=True,
-                        help="Path to the model parameters.")
-    parser.add_argument('--device', default='cuda',
-                        help='device to use for training / testing')
-    parser.add_argument('--pretrained_encoder', type=str, default=None, 
-                        help="Path to the pretrained encoder.")
-    
-    # * Backbone
-    parser.add_argument('--encoder', default='vit_tiny', type=str,
-                        help="Name of the transformer or convolutional encoder to use")
-    parser.add_argument('--vit_encoder_num_layers', default=12, type=int,
-                        help="Number of layers used in ViT encoder")
-    parser.add_argument('--window_block_indexes', default=None, type=int, nargs='+')
-    parser.add_argument('--position_embedding', default='sine', type=str, 
-                        choices=('sine', 'learned'),
-                        help="Type of positional embedding to use on top of the image features")
-    parser.add_argument('--out_feature_indexes', default=[-1], type=int, nargs='+', help='only for vit now')
-
-    # * Transformer
-    parser.add_argument('--dec_layers', default=3, type=int,
-                        help="Number of decoding layers in the transformer")
-    parser.add_argument('--dim_feedforward', default=2048, type=int,
-                        help="Intermediate size of the feedforward layers in the transformer blocks")
-    parser.add_argument('--hidden_dim', default=256, type=int,
-                        help="Size of the embeddings (dimension of the transformer)")
-    parser.add_argument('--sa_nheads', default=8, type=int,
-                        help="Number of attention heads inside the transformer's self-attentions")
-    parser.add_argument('--ca_nheads', default=8, type=int,
-                        help="Number of attention heads inside the transformer's cross-attentions")
-    parser.add_argument('--num_queries', default=300, type=int,
-                        help="Number of query slots")
-    parser.add_argument('--group_detr', default=13, type=int,
-                        help="Number of groups to speed up detr training")
-    parser.add_argument('--two_stage', action='store_true')
-    parser.add_argument('--projector_scale', default='P4', type=str, nargs='+', choices=('P3', 'P4', 'P5', 'P6'))
-    parser.add_argument('--lite_refpoint_refine', action='store_true', help='lite refpoint refine mode for speed-up')
-    parser.add_argument('--num_select', default=100, type=int,
-                        help='the number of predictions selected for evaluation')
-    parser.add_argument('--dec_n_points', default=4, type=int,
-                        help='the number of sampling points')
-    parser.add_argument('--decoder_norm', default='LN', type=str)
-    parser.add_argument('--bbox_reparam', action='store_true')
-
-    # * Dataset infomation
-    parser.add_argument('--dataset_file', default='coco')
-
-    # * Matcher
-    parser.add_argument('--set_cost_class', default=2, type=float,
-                        help="Class coefficient in the matching cost")
-    parser.add_argument('--set_cost_bbox', default=5, type=float,
-                        help="L1 box coefficient in the matching cost")
-    parser.add_argument('--set_cost_giou', default=2, type=float,
-                        help="giou box coefficient in the matching cost")
-
-    # * Learning rate
-    parser.add_argument('--lr', default=1e-4, type=float)
-    parser.add_argument('--lr_encoder', default=1.5e-4, type=float)
-    parser.add_argument('--batch_size', default=2, type=int)
-    parser.add_argument('--weight_decay', default=1e-4, type=float)
-    parser.add_argument('--epochs', default=12, type=int)
-    parser.add_argument('--lr_drop', default=11, type=int)
-    parser.add_argument('--clip_max_norm', default=0.1, type=float,
-                        help='gradient clipping max norm')
-    parser.add_argument('--lr_vit_layer_decay', default=0.8, type=float)
-    parser.add_argument('--lr_component_decay', default=1.0, type=float)
-    
-    # * Drop args
-    parser.add_argument('--dropout', type=float, default=0,
-                        help='Drop path rate (default: 0.0)')
-    parser.add_argument('--drop_path', type=float, default=0,
-                        help='Drop path rate (default: 0.0)')
-
-    # * Loss coefficients
-    parser.add_argument('--cls_loss_coef', default=2, type=float)
-    parser.add_argument('--bbox_loss_coef', default=5, type=float)
-    parser.add_argument('--giou_loss_coef', default=2, type=float)
-    parser.add_argument('--focal_alpha', default=0.25, type=float)
-    
-    # * Loss
-    parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
-                        help="Disables auxiliary decoding losses (loss at each layer)")
-    parser.add_argument('--sum_group_losses', action='store_true',
-                        help="To sum losses across groups or mean losses.")
-    parser.add_argument('--use_varifocal_loss', action='store_true')
-    parser.add_argument('--use_position_supervised_loss', action='store_true')
-    parser.add_argument('--ia_bce_loss', action='store_true')
-
-    # * Input and output
-    parser.add_argument('--input', default=None, required=True,
-                        help='"Path to image file."')
-    parser.add_argument('--output_dir', default='output',
-                        help='Directory to save output visualizations.')
-    parser.add_argument('--confidence_threshold', type=float, default=0.5,
-                        help='Minimum score for instance predictions to be shown')
-
-    return parser
 
 def get_default_args():
     defaults = {

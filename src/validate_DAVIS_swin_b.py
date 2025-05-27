@@ -473,7 +473,7 @@ def main():
 
     # sequence_names = sorted(os.listdir("/data/DAVIS/JPEGImages/480p"))
     # sequence_names = sequence_names[64:]
-    sequence_names = ["bear"]
+    sequence_names = ["flamingo"]
     # gops = [1, 2, 3, 6, 30, 100]
     gops = [1]
 

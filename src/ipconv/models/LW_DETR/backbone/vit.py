@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from fairscale.nn.checkpoint import checkpoint_wrapper
-from timm.models.layers import DropPath, Mlp, trunc_normal_
+from timm.layers import DropPath, Mlp, trunc_normal_
 
 from ..util.box_ops import box_cxcywh_to_xyxy
 
@@ -215,10 +215,20 @@ class Block(nn.Module):
 
         x = shortcut + self.drop_path(x)
         if self.use_cae:
-            x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
+            # x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
+            x_cached = x
+            x = self.norm2(x)
+            x = self.gamma_2 * self.mlp(x)
+            x = self.drop_path(x)
+            x = x + x_cached
         else:
-            x = x + self.drop_path(self.mlp(self.norm2(x)))
-
+            # x = x + self.drop_path(self.mlp(self.norm2(x)))
+            x_cached = x
+            x = self.norm2(x)
+            x = self.mlp(x)
+            x = self.drop_path(x)
+            x = x + x_cached
+        
         return x
 
 
@@ -341,11 +351,6 @@ class ViT(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
-        # resize to (1, 3, 1024, 1024)
-        x = F.interpolate(
-            x, size=(1024, 1024), mode='bilinear', align_corners=False
-        )
-
         x = self.patch_embed(x)
 
         if self.pos_embed is not None:
@@ -368,4 +373,6 @@ class ViT(nn.Module):
             if self._out_features[idx]:
                 out.append(x.reshape(B, 4, 4, h, w, C).permute(
                     0, 5, 1, 3, 2, 4).reshape(B, C, H, W))
+                
+        # out = [torch.randn(1, 768, 64, 64, device=x.device)] * 4
         return out
