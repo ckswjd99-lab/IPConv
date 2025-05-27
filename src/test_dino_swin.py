@@ -1,0 +1,106 @@
+import torch
+from torchvision import transforms
+from PIL import Image, ImageDraw, ImageFont
+
+from ipconv.models.DINO import build_dino_4scale_swin
+from ipconv.models.DINO.util.misc import nested_tensor_from_tensor_list
+
+COCO_CLASSES = [
+    '__background__', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
+    'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'N/A', 'stop sign',
+    'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+    'elephant', 'bear', 'zebra', 'giraffe', 'N/A', 'backpack', 'umbrella', 'N/A', 'N/A',
+    'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
+    'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+    'bottle', 'N/A', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana',
+    'apple', 'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut',
+    'cake', 'chair', 'couch', 'potted plant', 'bed', 'N/A', 'dining table', 'N/A', 'N/A',
+    'toilet', 'N/A', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone',
+    'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'N/A', 'book',
+    'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+]
+INPUT_PATH = '000000496954.jpg'
+OUTPUT_PATH = 'output.jpg'
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def preprocess_image(image_path):
+    image = Image.open(image_path).convert("RGB")
+    orig_image_size = torch.tensor(image.size[::-1])
+
+    normalize = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    transform = transforms.Compose([
+            transforms.Resize([1024, 1024]),
+            normalize,
+        ])
+    image = transform(image)
+    return image, orig_image_size
+
+def visualize_detections(image, boxes, labels, scores, conf_thresh, output_path):
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+
+    for box, label, score in zip(boxes, labels, scores):
+        if score > conf_thresh:
+            xmin, ymin, xmax, ymax = map(int, box)
+
+            draw.rectangle([xmin, ymin, xmax, ymax], outline="green", width=2)
+
+            text = f"{COCO_CLASSES[label]} {score:.2f}"
+            draw.text((xmin, ymin - 10), text, fill="green", font=font)
+
+    image.save(output_path)
+
+
+def main():
+    model, _, postprocessors = build_dino_4scale_swin()
+    model.eval()
+    model = model.to(DEVICE)
+
+    image, orig_image_size = preprocess_image(INPUT_PATH)
+    image = image.to(DEVICE)
+    orig_image_size = orig_image_size.to(DEVICE)
+    print(f"Image size: {orig_image_size}")
+
+    images = nested_tensor_from_tensor_list([image])
+    orig_image_sizes = torch.stack([orig_image_size])
+
+    # forward
+    with torch.no_grad():
+        import time
+
+        for _ in range(10):
+            outputs = model(images)
+
+        num_repeats = 10
+        start_time = time.time()
+        for _ in range(num_repeats):
+            outputs = model(images)
+        end_time = time.time()
+        print(f"Inference time for num_repeats iterations: {(end_time - start_time) / num_repeats:.4f} seconds per iteration")
+
+    # postprocess
+    predictions = postprocessors['bbox'](outputs, orig_image_sizes)
+
+    # visualize
+    boxes = predictions[0]['boxes'].cpu().numpy()
+    labels = predictions[0]['labels'].cpu().numpy()
+    scores = predictions[0]['scores'].cpu().numpy()
+
+    original_image = Image.open(INPUT_PATH).convert("RGB")
+    visualize_detections(
+        original_image,
+        boxes,
+        labels,
+        scores,
+        0.5,
+        OUTPUT_PATH)
+
+
+if __name__ == "__main__":
+    main()
+    print(f"Output saved to {OUTPUT_PATH}")
+    print("Validation completed successfully.")
