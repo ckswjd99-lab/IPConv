@@ -11,7 +11,7 @@ from torchvision.transforms import functional as F
 
 from typing import Dict, Tuple, List
 
-from ipconv.models import MaskedRCNN_ViT_B_FPN_Contexted
+from ipconv.models import DINO_4Scale_Swin_Contexted
 from ipconv.models.proc_image import visualize_detection, calculate_multi_iou
 from ipconv.models.constants import COCO_LABELS_LIST
 from ipconv.models.ViTDet.modeling.backbone.utils import expand_mask_neighbors, shrink_mask_neighbors
@@ -52,9 +52,9 @@ def create_sensitivity_map(
 def create_dirtiness_map(
     anchor_image: np.ndarray, 
     current_image: np.ndarray,
-    block_size: int = 16,
+    block_size: int = 4,
     dirty_thres: int = 30,
-    chromakey: np.ndarray = np.array([123.675, 116.28, 103.53], dtype=np.uint8),
+    chromakey: np.ndarray = np.array([0, 0, 0], dtype=np.uint8),
     sensi_map: np.ndarray = None,
 ) -> torch.Tensor:
     residual = cv2.absdiff(anchor_image, current_image)
@@ -67,13 +67,13 @@ def create_dirtiness_map(
 
     image_H, image_W = residual.shape[:2]
     
-    dirtiness_map = cv2.GaussianBlur(dirtiness_map, (15, 15), 1.5)
+    dirtiness_map = cv2.GaussianBlur(dirtiness_map, (7, 7), 1.5)
     if sensi_map is None:
         dirtiness_map = (dirtiness_map > dirty_thres).astype(np.float32)
     else:
         dirtiness_map = (dirtiness_map > dirty_thres * (1 - sensi_map)).astype(np.float32)
 
-    dirtiness_map = cv2.GaussianBlur(dirtiness_map, (15, 15), 1.5)
+    dirtiness_map = cv2.GaussianBlur(dirtiness_map, (7, 7), 1.5)
     dirtiness_map = cv2.resize(dirtiness_map, (image_W // block_size, image_H // block_size), interpolation=cv2.INTER_LINEAR)
     dirtiness_map = (dirtiness_map > 0).astype(np.float32)
 
@@ -177,7 +177,7 @@ def affine_ground_truth_boxes(boxes_gt, affine_matrix):
 
 @torch.no_grad()
 def single_inference(
-    model: MaskedRCNN_ViT_B_FPN_Contexted,
+    model: DINO_4Scale_Swin_Contexted,
     anchor_padded_ndarray: np.ndarray,  # (1024, 1024, 3)
     target_ndarray: np.ndarray,         # (H, W, 3)
     anchor_features: Dict[str, torch.Tensor],
@@ -204,7 +204,7 @@ def single_inference(
 
     # do jobs
     if refresh_anchor:
-        target_padded_ndarray = get_padded_image(target_ndarray, (1024, 1024), basic_scaling_factor)
+        target_padded_ndarray = get_padded_image(target_ndarray, (768, 1024), basic_scaling_factor)
         comp_end = time.time()
 
         (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(target_padded_ndarray)
@@ -276,7 +276,7 @@ def single_inference(
     
 
 @torch.no_grad()
-def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_dir="./output/contexted_inference_vitdet"):
+def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_dir="./output/contexted_inference_dino_swin"):
     # constants
     fixed_image_size = (1024, 1024)
     basic_scaling_factor = 1.05
@@ -336,7 +336,7 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
             shift_to_center = ((fixed_image_size[1] - current_image.shape[1]) // 2, (fixed_image_size[0] - current_image.shape[0]) // 2)
 
             current_image_padded = np.zeros((1024, 1024, 3), dtype=np.uint8)
-            current_image_padded[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
+            # current_image_padded[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
             current_image_padded[shift_to_center[1]:shift_to_center[1] + current_image.shape[0], shift_to_center[0]:shift_to_center[0] + current_image.shape[1]] = current_image
 
             (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(current_image_padded)
@@ -407,9 +407,9 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
         dmap_resized = cv2.resize(dirtiness_map[0, :, :, 0].cpu().numpy(), (target_padded_ndarray.shape[1], target_padded_ndarray.shape[0]), interpolation=cv2.INTER_NEAREST)
 
         vis_image = target_padded_ndarray.copy()
-        vis_image = vis_image.astype(np.uint16)
-        vis_image[:, :, 1] = np.clip(vis_image[:, :, 1] + dmap_resized * 50, 0, 255)
-        vis_image = vis_image.astype(np.uint8)
+        # vis_image = vis_image.astype(np.uint16)
+        # vis_image[:, :, 1] = np.clip(vis_image[:, :, 1] + dmap_resized * 50, 0, 255)
+        # vis_image = vis_image.astype(np.uint8)
 
         vis_image = visualize_detection(vis_image, boxes_gt, labels_gt, scores_gt, threshold=0.5, colors=np.array([[0, 0, 255] for _ in range(len(COCO_LABELS_LIST))]), labels_list=model.COCO_LABELS_LIST)
         vis_image = visualize_detection(vis_image, boxes_cont, labels_cont, scores_cont, threshold=0.5, colors=np.array([[0, 255, 0] for _ in range(len(COCO_LABELS_LIST))]), labels_list=model.COCO_LABELS_LIST)
@@ -463,17 +463,17 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
 def main():
 
     data_root = "/data/DAVIS"
-    output_dir = "./output/contexted_inference_vitdet"
+    output_dir = "./output/contexted_inference_dino_swin"
 
-    model = MaskedRCNN_ViT_B_FPN_Contexted("cuda")
-    model.load_weight("./ipconv/models/model_final_61ccd1.pkl")
+    model = DINO_4Scale_Swin_Contexted("cuda")
+    # model.load_weight("./ipconv/models/model_final_61ccd1.pkl")
     model.eval()
 
     # sequence_names = sorted(os.listdir("/data/DAVIS/JPEGImages/480p"))
     # sequence_names = sequence_names[64:]
-    sequence_names = ["bear", "dog-gooses", "flamingo", "surf", "skate-park"]
+    sequence_names = ["bear", "camel", "skate-park", "tuk-tuk"]
     # gops = [1, 2, 3, 6, 30, 100]
-    gops = [1, 100]
+    gops = [1]
 
     log_text = "Sequence, "
     for gop in gops:
