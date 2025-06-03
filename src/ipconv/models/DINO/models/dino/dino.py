@@ -35,6 +35,10 @@ from .utils import sigmoid_focal_loss, MLP
 
 from ..registry import MODULE_BUILD_FUNCS
 from .dn_components import prepare_for_cdn,dn_post_process
+
+from typing import Dict
+from .deformable_transformer import DeformableTransformer
+
 class DINO(nn.Module):
     """ This is the Cross-Attention Detector module that performs object detection """
     def __init__(self, backbone, transformer, num_classes, num_queries, 
@@ -73,7 +77,7 @@ class DINO(nn.Module):
         """
         super().__init__()
         self.num_queries = num_queries
-        self.transformer = transformer
+        self.transformer: DeformableTransformer = transformer
         self.num_classes = num_classes
         self.hidden_dim = hidden_dim = transformer.d_model
         self.num_feature_levels = num_feature_levels
@@ -320,6 +324,134 @@ class DINO(nn.Module):
         out['dn_meta'] = dn_meta
 
         return out
+    
+    def forward_contexted(
+        self, 
+        samples: NestedTensor,
+        cache_prefix: str = "model",
+        anchor_features: Dict[str, torch.Tensor] = {},
+        new_cache_features: Dict[str, torch.Tensor] = {},
+        dirtiness_map: torch.Tensor = torch.ones(1, 256, 256, 1, device="cuda"),
+        only_backbone: bool = False,
+    ):
+        """ The forward expects a NestedTensor, which consists of:
+               - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
+               - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
+
+            It returns a dict with the following elements:
+               - "pred_logits": the classification logits (including no-object) for all queries.
+                                Shape= [batch_size x num_queries x num_classes]
+               - "pred_boxes": The normalized boxes coordinates for all queries, represented as
+                               (center_x, center_y, width, height). These values are normalized in [0, 1],
+                               relative to the size of each individual image (disregarding possible padding).
+                               See PostProcess for information on how to retrieve the unnormalized bounding box.
+               - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
+                                dictionnaries containing the two above keys for each decoder layer.
+        """
+        targets = None
+
+        if isinstance(samples, (list, torch.Tensor)):
+            samples = nested_tensor_from_tensor_list(samples)
+        
+        # features, poss = self.backbone(samples)
+        xs, new_cache_features = self.backbone[0].forward_contexted(
+            samples,
+            cache_prefix=f"{cache_prefix}.backbone.0",
+            anchor_features=anchor_features,
+            new_cache_features=new_cache_features,
+            dirtiness_map=dirtiness_map
+        )
+        features: List[NestedTensor] = []
+        poss = []
+        for name, x in xs.items():
+            features.append(x)
+            # position encoding
+            poss.append(self.backbone[1](x).to(x.tensors.dtype))
+
+
+        srcs = []
+        masks = []
+        for l, feat in enumerate(features):
+            src, mask = feat.decompose()
+            srcs.append(self.input_proj[l](src))
+            masks.append(mask)
+            assert mask is not None
+        if self.num_feature_levels > len(srcs):
+            _len_srcs = len(srcs)
+            for l in range(_len_srcs, self.num_feature_levels):
+                if l == _len_srcs:
+                    src = self.input_proj[l](features[-1].tensors)
+                else:
+                    src = self.input_proj[l](srcs[-1])
+                m = samples.mask
+                mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
+                pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
+                srcs.append(src)
+                masks.append(mask)
+                poss.append(pos_l)
+
+        if self.dn_number > 0 or targets is not None:
+            input_query_label, input_query_bbox, attn_mask, dn_meta =\
+                prepare_for_cdn(dn_args=(targets, self.dn_number, self.dn_label_noise_ratio, self.dn_box_noise_scale),
+                                training=self.training,num_queries=self.num_queries,num_classes=self.num_classes,
+                                hidden_dim=self.hidden_dim,label_enc=self.label_enc)
+        else:
+            assert targets is None
+            input_query_bbox = input_query_label = attn_mask = dn_meta = None
+
+        hs, reference, hs_enc, ref_enc, init_box_proposal = self.transformer(srcs, masks, input_query_bbox, poss,input_query_label,attn_mask)
+        # In case num object=0
+        hs[0] += self.label_enc.weight[0,0]*0.0
+
+        # deformable-detr-like anchor update
+        # reference_before_sigmoid = inverse_sigmoid(reference[:-1]) # n_dec, bs, nq, 4
+        outputs_coord_list = []
+        for dec_lid, (layer_ref_sig, layer_bbox_embed, layer_hs) in enumerate(zip(reference[:-1], self.bbox_embed, hs)):
+            layer_delta_unsig = layer_bbox_embed(layer_hs)
+            layer_outputs_unsig = layer_delta_unsig  + inverse_sigmoid(layer_ref_sig)
+            layer_outputs_unsig = layer_outputs_unsig.sigmoid()
+            outputs_coord_list.append(layer_outputs_unsig)
+        outputs_coord_list = torch.stack(outputs_coord_list)        
+
+        outputs_class = torch.stack([layer_cls_embed(layer_hs) for
+                                     layer_cls_embed, layer_hs in zip(self.class_embed, hs)])
+        if self.dn_number > 0 and dn_meta is not None:
+            outputs_class, outputs_coord_list = \
+                dn_post_process(outputs_class, outputs_coord_list,
+                                dn_meta,self.aux_loss,self._set_aux_loss)
+        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord_list[-1]}
+        if self.aux_loss:
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord_list)
+
+
+        # for encoder output
+        if hs_enc is not None:
+            # prepare intermediate outputs
+            interm_coord = ref_enc[-1]
+            interm_class = self.transformer.enc_out_class_embed(hs_enc[-1])
+            out['interm_outputs'] = {'pred_logits': interm_class, 'pred_boxes': interm_coord}
+            out['interm_outputs_for_matching_pre'] = {'pred_logits': interm_class, 'pred_boxes': init_box_proposal}
+
+            # prepare enc outputs
+            if hs_enc.shape[0] > 1:
+                enc_outputs_coord = []
+                enc_outputs_class = []
+                for layer_id, (layer_box_embed, layer_class_embed, layer_hs_enc, layer_ref_enc) in enumerate(zip(self.enc_bbox_embed, self.enc_class_embed, hs_enc[:-1], ref_enc[:-1])):
+                    layer_enc_delta_unsig = layer_box_embed(layer_hs_enc)
+                    layer_enc_outputs_coord_unsig = layer_enc_delta_unsig + inverse_sigmoid(layer_ref_enc)
+                    layer_enc_outputs_coord = layer_enc_outputs_coord_unsig.sigmoid()
+
+                    layer_enc_outputs_class = layer_class_embed(layer_hs_enc)
+                    enc_outputs_coord.append(layer_enc_outputs_coord)
+                    enc_outputs_class.append(layer_enc_outputs_class)
+
+                out['enc_outputs'] = [
+                    {'pred_logits': a, 'pred_boxes': b} for a, b in zip(enc_outputs_class, enc_outputs_coord)
+                ]
+
+        out['dn_meta'] = dn_meta
+
+        return out, new_cache_features
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord):

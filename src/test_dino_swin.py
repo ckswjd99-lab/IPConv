@@ -32,26 +32,33 @@ def preprocess_image(image_path):
     image_orig = Image.open(image_path).convert("RGB")
     # image = cv2.imread(image_path)
     # image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    orig_image_size = torch.tensor(image_orig.size[::-1])
+    # orig_image_size = torch.tensor(image_orig.size[::-1])
+    orig_image_size = torch.tensor((1024, 1024), dtype=torch.float32)  # Assuming fixed size for padding
 
     normalize = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     transform = transforms.Compose([
-            transforms.Resize([1024 - 512, 1024 - 256]),
-            transforms.Pad((128, 256)),
             normalize,
         ])
     image = transform(image_orig)
+    image_padded = torch.zeros((3, 1024, 1024), dtype=image.dtype, device=image.device)
+    center_shift_x = (1024 - image.shape[1]) // 2
+    center_shift_y = (1024 - image.shape[2]) // 2
+    image_padded[:, center_shift_x:center_shift_x + image.shape[1], center_shift_y:center_shift_y + image.shape[2]] = image
+    image = image_padded
 
     image_orig = Image.open(image_path).convert("RGB")
     transform = transforms.Compose([
-            transforms.Resize([1024 - 512, 1024 - 256]),
-            transforms.Pad((128, 256)),
             transforms.ToTensor(),
         ])
     image_t = transform(image_orig)
+    image_t_padded = torch.zeros((3, 1024, 1024), dtype=image_t.dtype, device=image_t.device)
+    center_shift_x = (1024 - image_t.shape[1]) // 2
+    center_shift_y = (1024 - image_t.shape[2]) // 2
+    image_t_padded[:, center_shift_x:center_shift_x + image_t.shape[1], center_shift_y:center_shift_y + image_t.shape[2]] = image_t
+    image_t = image_t_padded
 
     return image, orig_image_size, image_t
 
@@ -70,8 +77,8 @@ def visualize_detections(image, boxes, labels, scores, conf_thresh, output_path)
 
 
 def main():
-    model, _, postprocessors = build_dino_4scale_swin()
-    # model, _, postprocessors = build_dino_5scale_swin()
+    # model, _, postprocessors = build_dino_4scale_swin()
+    model, _, postprocessors = build_dino_5scale_swin()
     model.eval()
     model = model.to(DEVICE)
 
@@ -118,7 +125,7 @@ def main():
         labels = predictions[0]['labels'].cpu().numpy()
         scores = predictions[0]['scores'].cpu().numpy()
 
-        boxes = (boxes * 1024).astype(int)  # Scale boxes to original image size
+        # boxes = (boxes * 1024).astype(int)  # Scale boxes to original image size
 
 
         # original_image = cv2.imread(INPUT_PATH)

@@ -306,6 +306,7 @@ class DeformableTransformer(nn.Module):
                 ref_token_index=enc_topk_proposals, # bs, nq 
                 ref_token_coord=enc_refpoint_embed, # bs, nq, 4
                 )
+        # memory = torch.randn((1, 21760, 256), device="cuda") # for debug
         #########################################################
         # End Encoder
         # - memory: bs, \sum{hw}, c
@@ -805,6 +806,17 @@ class DeformableTransformerEncoderLayer(nn.Module):
         return src
 
     def forward(self, src, pos, reference_points, spatial_shapes, level_start_index, key_padding_mask=None):
+        # return src
+        src_cached = src
+        
+        # rand_mask = torch.randperm(src.shape[1], device=src.device)[:src.shape[1] // 4]
+        # src = src[:, rand_mask, :]
+        # pos = pos[:, rand_mask, :]
+        # reference_points = reference_points[:, rand_mask, :, :]
+        # spatial_shapes = spatial_shapes // 2
+        # level_start_index = level_start_index // 4
+        # key_padding_mask = key_padding_mask[:, rand_mask]
+
         # self attention
         src2 = self.self_attn(self.with_pos_embed(src, pos), reference_points, src, spatial_shapes, level_start_index, key_padding_mask)
         src = src + self.dropout1(src2)
@@ -818,6 +830,7 @@ class DeformableTransformerEncoderLayer(nn.Module):
             src = self.norm_channel(src + self.activ_channel(src))
 
         return src
+        # return src_cached
 
 class DeformableTransformerDecoderLayer(nn.Module):
     def __init__(self, d_model=256, d_ffn=1024,
@@ -974,7 +987,6 @@ class DeformableTransformerDecoderLayer(nn.Module):
                 self_attn_mask: Optional[Tensor] = None, # mask used for self-attention
                 cross_attn_mask: Optional[Tensor] = None, # mask used for cross-attention
             ):
-
         for funcname in self.module_seq:
             if funcname == 'ffn':
                 tgt = self.forward_ffn(tgt)

@@ -14,6 +14,8 @@ import numpy as np
 from timm.layers import DropPath, to_2tuple, trunc_normal_
 from ...util.misc import NestedTensor
 
+from typing import Dict
+
 
 class Mlp(nn.Module):
     """ Multilayer perceptron."""
@@ -146,6 +148,56 @@ class WindowAttention(nn.Module):
         x = self.proj_drop(x)
         return x
 
+    def forward_contexted(
+        self, x, mask=None,
+        cache_prefix: str = "",
+        anchor_features: Dict[str, torch.Tensor] = {},
+        new_cache_features: Dict[str, torch.Tensor] = {},
+        dirtiness_map: torch.Tensor = torch.ones(484, 1, 1, device="cuda")
+    ):
+        """ Forward function.
+        Args:
+            x: input features with shape of (num_windows*B, N, C)
+            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+        """
+        x_cached = x
+
+        x = x[dirtiness_map[:, 0, 0] == 1, :, :]
+
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))
+
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        if mask is not None:
+            mask = mask[dirtiness_map[:, 0, 0] == 1, :, :]
+
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+            attn = self.softmax(attn)
+        else:
+            attn = self.softmax(attn)
+
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        fname = f"{cache_prefix}.output"
+        x_result = anchor_features[fname] if fname in anchor_features else torch.zeros_like(x_cached)
+        x_result[dirtiness_map[:, 0, 0] == 1, :, :] = x
+
+        return x_result, new_cache_features
+
 
 class SwinTransformerBlock(nn.Module):
     """ Swin Transformer Block.
@@ -245,6 +297,112 @@ class SwinTransformerBlock(nn.Module):
         x = x + self.drop_path(self.mlp(self.norm2(x)))
 
         return x
+    
+    def forward_contexted(
+            self, x, mask_matrix,
+            cache_prefix: str = "",
+            anchor_features: Dict[str, torch.Tensor] = {},
+            new_cache_features: Dict[str, torch.Tensor] = {},
+            dirtiness_map: torch.Tensor = torch.ones(1, 256, 256, 1, device="cuda")
+        ):
+        """ Forward function.
+        Args:
+            x: Input feature, tensor size (B, H*W, C).
+            H, W: Spatial resolution of the input feature.
+            mask_matrix: Attention mask for cyclic shift.
+        """
+        B, L, C = x.shape
+        H, W = self.H, self.W
+        assert L == H * W, "input feature has wrong size"
+
+        # resize dirtiness map to match the input feature size
+        dmap_resized = F.interpolate(
+            dirtiness_map.permute(0, 3, 1, 2),  # (B, 1, H, W)
+            size=(H, W),
+            mode="area"
+        ).permute(0, 2, 3, 1)
+        dmap_resized = (dmap_resized > 0).float()
+        dmap_flattened = dmap_resized.view(B, H * W, 1) # (B, H*W, 1)
+        
+
+        # replace x: Tensor[B, L, C]
+        fname = f"{cache_prefix}.x_initial"
+        if fname in anchor_features:
+            x = anchor_features[fname] * (1 - dmap_flattened) + x * dmap_flattened
+        new_cache_features[fname] = x
+
+        shortcut = x
+        x = self.norm1(x)
+        x = x.view(B, H, W, C)
+
+        # pad feature maps to multiples of window size
+        pad_l = pad_t = 0
+        pad_r = (self.window_size - W % self.window_size) % self.window_size
+        pad_b = (self.window_size - H % self.window_size) % self.window_size
+        x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b))
+        dmap_padded = F.pad(dmap_resized, (0, 0, pad_l, pad_r, pad_t, pad_b))
+        _, Hp, Wp, _ = x.shape
+
+        # cyclic shift
+        if self.shift_size > 0:
+            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            attn_mask = mask_matrix
+        else:
+            shifted_x = x
+            attn_mask = None
+
+        # partition windows
+        x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
+
+        dmap_windows = window_partition(dmap_padded, self.window_size)  # nW*B, window_size, window_size, 1
+        dmap_windows = dmap_windows.view(-1, self.window_size * self.window_size, 1)  # nW*B, window_size*window_size, 1
+        dmap_windows = dmap_windows.mean(dim=1, keepdim=True)  # nW*B, 1, 1
+        dmap_windows = (dmap_windows > 0).float()  # nW*B, 1, 1
+        # print(f"{cache_prefix}: {dmap_windows.mean().item():.4f} dirtiness ratio")
+
+        # W-MSA/SW-MSA
+        # attn_windows = self.attn(x_windows, mask=attn_mask)  # nW*B, window_size*window_size, C
+        attn_windows, new_cache_features = self.attn.forward_contexted(
+            x_windows, mask=attn_mask,
+            cache_prefix=f"{cache_prefix}.attn",
+            anchor_features=anchor_features,
+            new_cache_features=new_cache_features,
+            dirtiness_map=dmap_windows
+        )
+
+        # merge windows
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        shifted_x = window_reverse(attn_windows, self.window_size, Hp, Wp)  # B H' W' C
+
+        # reverse cyclic shift
+        if self.shift_size > 0:
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted_x
+
+        if pad_r > 0 or pad_b > 0:
+            x = x[:, :H, :W, :].contiguous()
+
+        x = x.view(B, H * W, C)
+
+        # FFN
+        x = shortcut + self.drop_path(x)
+
+        x_cached = x
+
+        ## partial MLP
+        x_selected = x[dmap_resized.view(B, H * W) > 0]
+        x_selected = self.drop_path(self.mlp(self.norm2(x_selected)))
+        
+        fname = f"{cache_prefix}.x_before_mlp"
+        x = anchor_features[fname] if fname in anchor_features else torch.zeros_like(x_cached)
+        x[dmap_resized.view(B, H * W) > 0] = x_selected
+        new_cache_features[fname] = x
+        
+        x = x_cached + x
+
+        return x, new_cache_features
 
 
 class PatchMerging(nn.Module):
@@ -388,6 +546,58 @@ class BasicLayer(nn.Module):
             return x, H, W, x_down, Wh, Ww
         else:
             return x, H, W, x, H, W
+        
+    def forward_contexted(
+            self, x, H, W,
+            cache_prefix: str = "",
+            anchor_features: Dict[str, torch.Tensor] = {},
+            new_cache_features: Dict[str, torch.Tensor] = {},
+            dirtiness_map: torch.Tensor = torch.ones(1, 256, 256, 1, device="cuda")
+        ):
+        """ Forward function.
+        Args:
+            x: Input feature, tensor size (B, H*W, C).
+            H, W: Spatial resolution of the input feature.
+        """
+
+        # calculate attention mask for SW-MSA
+        Hp = int(np.ceil(H / self.window_size)) * self.window_size
+        Wp = int(np.ceil(W / self.window_size)) * self.window_size
+        img_mask = torch.zeros((1, Hp, Wp, 1), device=x.device)  # 1 Hp Wp 1
+        h_slices = (slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None))
+        w_slices = (slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None))
+        cnt = 0
+        for h in h_slices:
+            for w in w_slices:
+                img_mask[:, h, w, :] = cnt
+                cnt += 1
+
+        mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
+        mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+
+        for bidx, blk in enumerate(self.blocks):
+            blk: SwinTransformerBlock
+            blk.H, blk.W = H, W
+            
+            x, new_cache_features = blk.forward_contexted(
+                x, attn_mask,
+                cache_prefix=f"{cache_prefix}.blocks.{bidx}",
+                anchor_features=anchor_features,
+                new_cache_features=new_cache_features,
+                dirtiness_map=dirtiness_map
+            )
+        if self.downsample is not None:
+            x_down = self.downsample(x, H, W)
+            Wh, Ww = (H + 1) // 2, (W + 1) // 2
+            return (x, H, W, x_down, Wh, Ww), new_cache_features
+        else:
+            return (x, H, W, x, H, W), new_cache_features
 
 
 class PatchEmbed(nn.Module):
@@ -671,6 +881,61 @@ class SwinTransformer(nn.Module):
             outs_dict[idx] = NestedTensor(out_i, mask)
 
         return outs_dict
+    
+    def forward_contexted(
+            self, 
+            tensor_list: NestedTensor,
+            cache_prefix: str = "",
+            anchor_features: Dict[str, torch.Tensor] = {},
+            new_cache_features: Dict[str, torch.Tensor] = {},
+            dirtiness_map: torch.Tensor = torch.ones(1, 256, 256, 1, device="cuda")
+        ):
+        x = tensor_list.tensors
+
+        """Forward function."""
+        x = self.patch_embed(x)
+
+        Wh, Ww = x.size(2), x.size(3)
+        if self.ape:
+            # interpolate the position embedding to the corresponding size
+            absolute_pos_embed = F.interpolate(self.absolute_pos_embed, size=(Wh, Ww), mode='bicubic')
+            x = (x + absolute_pos_embed).flatten(2).transpose(1, 2)  # B Wh*Ww C
+        else:
+            x = x.flatten(2).transpose(1, 2)
+        x = self.pos_drop(x)
+
+        outs = []
+        for i in range(self.num_layers):
+            layer: BasicLayer = self.layers[i]
+            (x_out, H, W, x, Wh, Ww), new_cache_features = layer.forward_contexted(
+                x, Wh, Ww,
+                cache_prefix=f"{cache_prefix}.layers.{i}",
+                anchor_features=anchor_features,
+                new_cache_features=new_cache_features,
+                dirtiness_map=dirtiness_map
+            )
+
+            if i in self.out_indices:
+                norm_layer = getattr(self, f'norm{i}')
+                x_out = norm_layer(x_out)
+
+                out = x_out.view(-1, H, W, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
+                outs.append(out)
+        # in:
+        #   torch.Size([2, 3, 1024, 1024])
+        # out:
+        #   [torch.Size([2, 192, 256, 256]), torch.Size([2, 384, 128, 128]), \
+        #       torch.Size([2, 768, 64, 64]), torch.Size([2, 1536, 32, 32])]
+
+        # collect for nesttensors        
+        outs_dict = {}
+        for idx, out_i in enumerate(outs):
+            m = tensor_list.mask
+            assert m is not None
+            mask = F.interpolate(m[None].float(), size=out_i.shape[-2:]).to(torch.bool)[0]
+            outs_dict[idx] = NestedTensor(out_i, mask)
+
+        return outs_dict, new_cache_features
 
 
     def train(self, mode=True):

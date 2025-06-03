@@ -96,29 +96,36 @@ class DINO_4Scale_Swin_Contexted(nn.Module):
         self, 
         image_ndarray: np.ndarray, 
         anchor_features: Dict[str, torch.Tensor] = {},
-        dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda"),
+        dirtiness_map: torch.Tensor = torch.ones(1, 256, 256, 1, device="cuda"),
+        only_backbone: bool = False
     ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], Dict[str, torch.Tensor]]:
         # image_ndarray: (H, W, C)
         
         new_cache_features = {}
 
         image, orig_image_size = self.preprocess_image(image_ndarray)
-        # print(f"Image shape: {image.shape}, Original size: {orig_image_size}")
         image = image.to(self.device)
         orig_image_size = orig_image_size.to(self.device)
-        # print(f"Image size: {orig_image_size}")
 
         images = nested_tensor_from_tensor_list([image])
         orig_image_sizes = torch.stack([orig_image_size])
 
         # forward
-        outputs = self.model(images)
+        # outputs = self.model(images)
+        outputs, new_cache_features = self.model.forward_contexted(
+            images,
+            cache_prefix="model",
+            anchor_features=anchor_features,
+            new_cache_features=new_cache_features,
+            dirtiness_map=dirtiness_map,
+            only_backbone=only_backbone
+        )
 
         # postprocess
         predictions = self.postprocessors['bbox'](outputs, orig_image_sizes)
 
         # visualize
-        boxes = predictions[0]['boxes'].cpu().numpy() * 1024
+        boxes = predictions[0]['boxes'].cpu().numpy()
         labels = predictions[0]['labels'].cpu().numpy()
         scores = predictions[0]['scores'].cpu().numpy()
 
