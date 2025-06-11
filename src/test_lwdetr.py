@@ -22,7 +22,7 @@ COCO_CLASSES = [
     'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'N/A', 'book',
     'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
 ]
-INPUT_PATH = '000000496954.jpg'
+INPUT_PATH = '00000.jpg'
 OUTPUT_PATH = 'output.jpg'
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -35,10 +35,14 @@ def preprocess_image(image_path):
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     transform = transforms.Compose([
-            transforms.Resize([1024, 1024]),
+            transforms.Resize([1024 - 512, 1024 - 256]),
+            transforms.Pad([128, 256]),
             normalize,
         ])
     image = transform(image)
+
+    orig_image_size = torch.tensor([1024, 1024])
+
     return image, orig_image_size
 
 def visualize_detections(image, boxes, labels, scores, conf_thresh, output_path):
@@ -96,6 +100,13 @@ def main():
     scores = predictions[0]['scores'].cpu().numpy()
 
     original_image = Image.open(INPUT_PATH).convert("RGB")
+
+    transform = transforms.Compose([
+        transforms.Resize([1024 - 512, 1024 - 256]),
+        transforms.Pad([128, 256]),
+    ])
+    original_image = transform(original_image)
+
     visualize_detections(
         original_image,
         boxes,

@@ -7,11 +7,11 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import time
 
-import torch.nn.functional as F
+from torchvision.transforms import functional as F
 
 from typing import Dict, Tuple, List
 
-from ipconv.models import DINO_4Scale_Swin_Contexted, DINO_5Scale_Swin_Contexted
+from ipconv.models import MaskedRCNN_ViT_H_FPN_Contexted
 from ipconv.models.proc_image import visualize_detection, calculate_multi_iou
 from ipconv.models.constants import COCO_LABELS_LIST
 from ipconv.models.ViTDet.modeling.backbone.utils import expand_mask_neighbors, shrink_mask_neighbors
@@ -54,7 +54,7 @@ def create_dirtiness_map(
     current_image: np.ndarray,
     block_size: int = 16,
     dirty_thres: int = 30,
-    chromakey: np.ndarray = np.array([0, 0, 0], dtype=np.uint8),
+    chromakey: np.ndarray = np.array([123.675, 116.28, 103.53], dtype=np.uint8),
     sensi_map: np.ndarray = None,
 ) -> torch.Tensor:
     residual = cv2.absdiff(anchor_image, current_image)
@@ -81,14 +81,14 @@ def create_dirtiness_map(
     dirtiness_map = dirtiness_map.unsqueeze(0).unsqueeze(-1)
 
     # minimum recompute
-    # maxnum = 10
-    # while dirtiness_map.mean() < 0.1:
+    maxnum = 10
+    while dirtiness_map.mean() < 0.01:
 
-    #     dirtiness_map = expand_mask_neighbors(dirtiness_map)
+        dirtiness_map = expand_mask_neighbors(dirtiness_map)
 
-    #     maxnum -= 1
-    #     if maxnum == 0:
-    #         break
+        maxnum -= 1
+        if maxnum == 0:
+            break
 
     return dirtiness_map
 
@@ -98,6 +98,7 @@ def get_padded_image(image_ndarray: np.ndarray, size: Tuple[int, int], basic_sca
     shift_to_center = ((size[1] - image_scaled.shape[1]) // 2, (size[0] - image_scaled.shape[0]) // 2)
 
     padded_image = np.zeros((size[0], size[1], 3), dtype=np.uint8)
+    padded_image[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
     padded_image[shift_to_center[1]:shift_to_center[1] + image_scaled.shape[0], shift_to_center[0]:shift_to_center[0] + image_scaled.shape[1]] = image_scaled
 
     return padded_image
@@ -130,27 +131,6 @@ def estimate_affine_in_padded_anchor(
     return affine_matrix
 
 @torch.no_grad()
-def estimate_translation_by_template_matching(
-    anchor_padded_ndarray: np.ndarray,  # (1024, 1024, 3)
-    target_ndarray: np.ndarray,         # (H, W, 3)
-):
-    # Convert to grayscale
-    anchor_gray = cv2.cvtColor(anchor_padded_ndarray, cv2.COLOR_BGR2GRAY)
-    target_gray = cv2.cvtColor(target_ndarray, cv2.COLOR_BGR2GRAY)
-
-    # Template matching
-    result = cv2.matchTemplate(anchor_gray, target_gray, cv2.TM_CCOEFF_NORMED)
-    _, _, _, max_loc = cv2.minMaxLoc(result)
-
-    # max_loc gives top-left corner of best match
-    x, y = max_loc
-    affine_matrix = np.array([[1, 0, x],
-                               [0, 1, y]], dtype=np.float32)
-
-    return affine_matrix
-
-
-@torch.no_grad()
 def apply_affine_and_pad(
     target_ndarray: np.ndarray,  # (H, W, 3)
     affine_matrix: np.ndarray,  # (2, 3)
@@ -167,6 +147,7 @@ def apply_affine_and_pad(
     if np.any(transformed_points < 0) or np.any(transformed_points > 1024):
         return None
 
+    result_image[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
     result_image[mask] = transformed_target[mask]
 
     return result_image
@@ -196,7 +177,7 @@ def affine_ground_truth_boxes(boxes_gt, affine_matrix):
 
 @torch.no_grad()
 def single_inference(
-    model: DINO_4Scale_Swin_Contexted,
+    model: MaskedRCNN_ViT_H_FPN_Contexted,
     anchor_padded_ndarray: np.ndarray,  # (1024, 1024, 3)
     target_ndarray: np.ndarray,         # (H, W, 3)
     anchor_features: Dict[str, torch.Tensor],
@@ -204,11 +185,11 @@ def single_inference(
     recompute_threshold: float = 0.4,
     num_stages: int = 1,
     sensi_map: np.ndarray = None,
+    pshift: int = 0,  # not used in this function, but can be used for future extensions
 ):
     # COMPRESSION PART must not included in latency
     comp_start = time.time()
     affine_matrix = estimate_affine_in_padded_anchor(anchor_padded_ndarray, target_ndarray)
-    # affine_matrix = estimate_translation_by_template_matching(anchor_padded_ndarray, target_ndarray)
 
     target_padded_ndarray = apply_affine_and_pad(target_ndarray, affine_matrix)
 
@@ -227,7 +208,7 @@ def single_inference(
         target_padded_ndarray = get_padded_image(target_ndarray, (1024, 1024), basic_scaling_factor)
         comp_end = time.time()
 
-        (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(target_padded_ndarray)
+        (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(target_padded_ndarray, pshift=pshift)
         
         # affine matrix: translation with shift_to_center
         target_scaled_ndarray = cv2.resize(target_ndarray, (int(target_ndarray.shape[1] * basic_scaling_factor), int(target_ndarray.shape[0] * basic_scaling_factor)), interpolation=cv2.INTER_LINEAR)
@@ -244,14 +225,9 @@ def single_inference(
         }
     
     else:
-        dirtiness_map_16 = create_dirtiness_map(anchor_padded_ndarray, target_padded_ndarray, sensi_map=sensi_map, block_size=16)
-        dirtiness_map_4 = create_dirtiness_map(anchor_padded_ndarray, target_padded_ndarray, sensi_map=sensi_map, block_size=4)
-
-        # make intersection of the two dirtiness maps
-        dirtiness_map_16 = dirtiness_map_16.permute(0, 3, 1, 2)  # (1, 1, 64, 64)
-        dirtiness_map_16 = F.interpolate(dirtiness_map_16, scale_factor=4, mode='nearest')  # (1, 1, 256, 256)
-        dirtiness_map_16 = dirtiness_map_16.permute(0, 2, 3, 1)  # (1, 256, 256, 1)
-        dirtiness_map = torch.minimum(dirtiness_map_16, dirtiness_map_4)
+        dirtiness_map = create_dirtiness_map(anchor_padded_ndarray, target_padded_ndarray, sensi_map=sensi_map)
+        # dirtiness_map = torch.zeros_like(dirtiness_map, device="cuda")
+        # dirtiness_map[0, 0, 0, 0] = 1.0
 
         num_stages = 1
         stage_map = dirtiness_map
@@ -286,7 +262,7 @@ def single_inference(
                 continue
 
             is_last_stage = (stage == num_stages)
-            (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(target_padded_ndarray, anchor_features=cached_features_dict, dirtiness_map=now_dmap, only_backbone=not is_last_stage)
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(target_padded_ndarray, anchor_features=cached_features_dict, dirtiness_map=now_dmap, only_backbone=not is_last_stage, pshift=pshift)
             
         # (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(target_padded_ndarray, anchor_features=anchor_features, dirtiness_map=dirtiness_map)
         
@@ -301,13 +277,7 @@ def single_inference(
     
 
 @torch.no_grad()
-def validate_DAVIS(
-    model: DINO_4Scale_Swin_Contexted, 
-    sequence_name, 
-    gop, 
-    data_root="/data/DAVIS", 
-    output_dir="./output/contexted_inference_dino_swin"
-):
+def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_dir="./output/contexted_inference_vitdet_h", pshift: bool = False):
     # constants
     fixed_image_size = (1024, 1024)
     basic_scaling_factor = 1.05
@@ -323,11 +293,6 @@ def validate_DAVIS(
 
     output_path = f"{output_dir}/{sequence_name}"
     os.makedirs(output_path, exist_ok=True)
-
-    # warm up
-    for _ in range(10):
-        image_dummy = np.zeros((1024, 1024, 3), dtype=np.uint8)
-        model.forward_contexted(image_dummy)
 
     # iterate over images
     recompute_rates = []
@@ -372,15 +337,10 @@ def validate_DAVIS(
             shift_to_center = ((fixed_image_size[1] - current_image.shape[1]) // 2, (fixed_image_size[0] - current_image.shape[0]) // 2)
 
             current_image_padded = np.zeros((1024, 1024, 3), dtype=np.uint8)
-            # current_image_padded[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
+            current_image_padded[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
             current_image_padded[shift_to_center[1]:shift_to_center[1] + current_image.shape[0], shift_to_center[0]:shift_to_center[0] + current_image.shape[1]] = current_image
 
-            (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(current_image_padded)
-            # dmap_dummy = (torch.randn(1, 256, 256, 1, device="cuda") > 0).float()
-            # (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(
-            #     current_image_padded,
-            #     dirtiness_map=dmap_dummy
-            # )
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(current_image_padded, pshift=pshift)
             
             # affine matrix: translation with shift_to_center and scale with scaling_factor
             affine_matrix = np.array([[scaling_factor, 0, shift_to_center[0]], [0, scaling_factor, shift_to_center[1]]], dtype=np.float32)
@@ -404,6 +364,7 @@ def validate_DAVIS(
                 basic_scaling_factor=basic_scaling_factor,
                 num_stages=num_stages,
                 sensi_map=sensi_map,
+                pshift=pshift,
             )
 
             affine_matrix = intermediate_dict["affine_matrix"]
@@ -504,19 +465,21 @@ def validate_DAVIS(
 def main():
 
     data_root = "/data/DAVIS"
-    output_dir = "./output/contexted_inference_dino_swin"
+    output_dir = "./output/contexted_inference_vitdet_h"
 
-    model = DINO_4Scale_Swin_Contexted("cuda")
-    # model = DINO_5Scale_Swin_Contexted("cuda")
-    # model.load_weight("./ipconv/models/model_final_61ccd1.pkl")
+    model = MaskedRCNN_ViT_H_FPN_Contexted("cuda")
+    model.load_weight("./ipconv/models/model_final_7224f1.pkl")
     model.eval()
 
     # sequence_names = sorted(os.listdir("/data/DAVIS/JPEGImages/480p"))
+    # if "bear_prep" in sequence_names:
+    #     sequence_names.remove("bear_prep")
     # sequence_names = sequence_names[64:]
-    sequence_names = ["bear", "camel", "skate-park", "tuk-tuk"]
-    # sequence_names = ["bear"]
+    # sequence_names = ["bear", "dog-gooses", "flamingo", "tuk-tuk", "skate-park"]
+    sequence_names = ["bear"]
     # gops = [1, 2, 3, 6, 30, 100]
-    gops = [30]
+    # gops = [1, 2, 6, 100]
+    gops = [100]
 
     log_text = "Sequence, "
     for gop in gops:
@@ -527,71 +490,74 @@ def main():
         log_text += f"gop{gop}_throughput, "
     print(log_text)
 
-    for sequence_name in sequence_names:
-        recompute_rates = {}
-        iou_gt_results = {}
-        throughputs = {}
+    # for pshift in [0, 1, 2, 4]:
+    for pshift in [0]:
+        print(f"Processing with pshift={pshift}")
+        for sequence_name in sequence_names:
+            recompute_rates = {}
+            iou_gt_results = {}
+            throughputs = {}
 
-        os.makedirs(f"{output_dir}/{sequence_name}", exist_ok=True)
+            os.makedirs(f"{output_dir}/{sequence_name}", exist_ok=True)
 
-        for gop in gops:
-            avg_compute_rate, avg_iou_gt, stat_dicts = validate_DAVIS(model, sequence_name, gop, data_root, output_dir)
-            recompute_rates[gop] = stat_dicts["recompute_rates"]
-            iou_gt_results[gop] = stat_dicts["IoU_gt_results"]
-            throughputs[gop] = stat_dicts["throughput"]
-        
-        log_text = f"{sequence_name}, "
-        for rrate in recompute_rates:
-            log_text += f"{np.mean(recompute_rates[rrate]):f}, "
-        for iou in iou_gt_results:
-            log_text += f"{np.mean(iou_gt_results[iou]):f}, "
-        for tput in throughputs:
-            log_text += f"{1000/throughputs[tput]:f}, "
+            for gop in gops:
+                avg_compute_rate, avg_iou_gt, stat_dicts = validate_DAVIS(model, sequence_name, gop, data_root, output_dir, pshift=pshift)
+                recompute_rates[gop] = stat_dicts["recompute_rates"]
+                iou_gt_results[gop] = stat_dicts["IoU_gt_results"]
+                throughputs[gop] = stat_dicts["throughput"]
+            
+            log_text = f"{sequence_name}, "
+            for rrate in recompute_rates:
+                log_text += f"{np.mean(recompute_rates[rrate]):f}, "
+            for iou in iou_gt_results:
+                log_text += f"{np.mean(iou_gt_results[iou]):f}, "
+            for tput in throughputs:
+                log_text += f"{1000/throughputs[tput]:f}, "
 
-        print(log_text)
+            print(log_text)
 
-        # draw graphs
-        # recompute rates
-        plt.figure(figsize=(10, 5))
-        plt.title(f"Image sequence: {sequence_name}", fontsize=20)  # Increased font size
-        for gop in gops:
-            plt.plot(recompute_rates[gop], label=f"GOP={gop}")
-        plt.legend(fontsize=14)
-        plt.xlabel("Frame", fontsize=16)
-        plt.ylabel("Recompute rate", fontsize=16)
-        plt.xticks(fontsize=14)
-        plt.yticks(fontsize=14)
-        plt.grid()
-        plt.savefig(f"{output_dir}/{sequence_name}/recompute_rates.jpg")
-        plt.close()
+            # draw graphs
+            # recompute rates
+            plt.figure(figsize=(10, 5))
+            plt.title(f"Image sequence: {sequence_name}", fontsize=20)  # Increased font size
+            for gop in gops:
+                plt.plot(recompute_rates[gop], label=f"GOP={gop}")
+            plt.legend(fontsize=14)
+            plt.xlabel("Frame", fontsize=16)
+            plt.ylabel("Recompute rate", fontsize=16)
+            plt.xticks(fontsize=14)
+            plt.yticks(fontsize=14)
+            plt.grid()
+            plt.savefig(f"{output_dir}/{sequence_name}/recompute_rates.jpg")
+            plt.close()
 
-        # IoU results
-        plt.figure(figsize=(10, 5))
-        plt.title(f"Image sequence: {sequence_name}", fontsize=20)
-        for gop in gops:
-            plt.plot(iou_gt_results[gop], label=f"GOP={gop}")
-        plt.legend(fontsize=14)
-        plt.xlabel("Frame", fontsize=16)
-        plt.ylabel("IoU (GT)", fontsize=16)
-        plt.xticks(fontsize=14)
-        plt.yticks(fontsize=14)
-        plt.grid()
-        plt.savefig(f"{output_dir}/{sequence_name}/iou_results.jpg")
-        plt.close()
+            # IoU results
+            plt.figure(figsize=(10, 5))
+            plt.title(f"Image sequence: {sequence_name}", fontsize=20)
+            for gop in gops:
+                plt.plot(iou_gt_results[gop], label=f"GOP={gop}")
+            plt.legend(fontsize=14)
+            plt.xlabel("Frame", fontsize=16)
+            plt.ylabel("IoU (GT)", fontsize=16)
+            plt.xticks(fontsize=14)
+            plt.yticks(fontsize=14)
+            plt.grid()
+            plt.savefig(f"{output_dir}/{sequence_name}/iou_results.jpg")
+            plt.close()
 
-        # throughput
-        plt.figure(figsize=(10, 5))
-        plt.title(f"Image sequence: {sequence_name}", fontsize=20)
-        for gop in gops:
-            plt.plot(throughputs[gop], label=f"GOP={gop}")
-        plt.legend(fontsize=14)
-        plt.xlabel("Frame", fontsize=16)
-        plt.ylabel("Throughput (FPS)", fontsize=16)
-        plt.xticks(fontsize=14)
-        plt.yticks(fontsize=14)
-        plt.grid()
-        plt.savefig(f"{output_dir}/{sequence_name}/throughput.jpg")
-        plt.close()
+            # throughput
+            plt.figure(figsize=(10, 5))
+            plt.title(f"Image sequence: {sequence_name}", fontsize=20)
+            for gop in gops:
+                plt.plot(throughputs[gop], label=f"GOP={gop}")
+            plt.legend(fontsize=14)
+            plt.xlabel("Frame", fontsize=16)
+            plt.ylabel("Throughput (FPS)", fontsize=16)
+            plt.xticks(fontsize=14)
+            plt.yticks(fontsize=14)
+            plt.grid()
+            plt.savefig(f"{output_dir}/{sequence_name}/throughput.jpg")
+            plt.close()
 
 
 

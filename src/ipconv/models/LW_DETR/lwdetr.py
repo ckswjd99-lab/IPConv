@@ -108,6 +108,9 @@ class LWDETR(nn.Module):
             if hasattr(m, "export") and isinstance(m.export, Callable) and hasattr(m, "_export") and not m._export:
                 m.export()
 
+    feature_cache = None
+    poss_cache = None
+
     def forward(self, samples: NestedTensor, targets=None):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
@@ -125,6 +128,13 @@ class LWDETR(nn.Module):
         """
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
+        
+        # if self.feature_cache is None or self.poss_cache is None:
+        #     features, poss = self.backbone(samples)
+        #     self.feature_cache = features
+        #     self.poss_cache = poss
+        # else:
+        #     features, poss = self.feature_cache, self.poss_cache
         features, poss = self.backbone(samples)
 
         srcs = []

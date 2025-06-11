@@ -473,7 +473,7 @@ def main():
     # sequence_names = sequence_names[64:]
     sequence_names = ["bear", "dog-gooses", "flamingo", "surf", "skate-park"]
     # gops = [1, 2, 3, 6, 30, 100]
-    gops = [1, 100]
+    gops = [1]
 
     log_text = "Sequence, "
     for gop in gops:

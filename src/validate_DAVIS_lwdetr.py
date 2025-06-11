@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from typing import Dict, Tuple, List
 
-from ipconv.models import DINO_4Scale_Swin_Contexted, DINO_5Scale_Swin_Contexted
+from ipconv.models import LWDETR_xLarge_Contexted
 from ipconv.models.proc_image import visualize_detection, calculate_multi_iou
 from ipconv.models.constants import COCO_LABELS_LIST
 from ipconv.models.ViTDet.modeling.backbone.utils import expand_mask_neighbors, shrink_mask_neighbors
@@ -196,7 +196,7 @@ def affine_ground_truth_boxes(boxes_gt, affine_matrix):
 
 @torch.no_grad()
 def single_inference(
-    model: DINO_4Scale_Swin_Contexted,
+    model: LWDETR_xLarge_Contexted,
     anchor_padded_ndarray: np.ndarray,  # (1024, 1024, 3)
     target_ndarray: np.ndarray,         # (H, W, 3)
     anchor_features: Dict[str, torch.Tensor],
@@ -302,11 +302,11 @@ def single_inference(
 
 @torch.no_grad()
 def validate_DAVIS(
-    model: DINO_4Scale_Swin_Contexted, 
+    model: LWDETR_xLarge_Contexted, 
     sequence_name, 
     gop, 
     data_root="/data/DAVIS", 
-    output_dir="./output/contexted_inference_dino_swin"
+    output_dir="./output/contexted_inference_lwdetr_xlarge",
 ):
     # constants
     fixed_image_size = (1024, 1024)
@@ -376,6 +376,12 @@ def validate_DAVIS(
             current_image_padded[shift_to_center[1]:shift_to_center[1] + current_image.shape[0], shift_to_center[0]:shift_to_center[0] + current_image.shape[1]] = current_image
 
             (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(current_image_padded)
+
+            # print maximum confident box
+            if len(boxes_cont) > 0:
+                max_score_idx = np.argmax(scores_cont)
+                print(f"Maximum confident box: {boxes_cont[max_score_idx]}, score: {scores_cont[max_score_idx]}")
+            
             # dmap_dummy = (torch.randn(1, 256, 256, 1, device="cuda") > 0).float()
             # (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(
             #     current_image_padded,
@@ -452,8 +458,8 @@ def validate_DAVIS(
         vis_image[:, :, 1] = np.clip(vis_image[:, :, 1] + dmap_resized * 50, 0, 255)
         vis_image = vis_image.astype(np.uint8)
 
-        vis_image = visualize_detection(vis_image, boxes_gt, labels_gt, scores_gt, threshold=0.5, colors=np.array([[0, 0, 255] for _ in range(len(COCO_LABELS_LIST))]), labels_list=model.COCO_LABELS_LIST)
-        vis_image = visualize_detection(vis_image, boxes_cont, labels_cont, scores_cont, threshold=0.5, colors=np.array([[0, 255, 0] for _ in range(len(COCO_LABELS_LIST))]), labels_list=model.COCO_LABELS_LIST)
+        vis_image = visualize_detection(vis_image, boxes_gt, labels_gt, scores_gt, threshold=0.01, colors=np.array([[0, 0, 255] for _ in range(len(COCO_LABELS_LIST))]), labels_list=model.COCO_LABELS_LIST)
+        vis_image = visualize_detection(vis_image, boxes_cont, labels_cont, scores_cont, threshold=0.01, colors=np.array([[0, 255, 0] for _ in range(len(COCO_LABELS_LIST))]), labels_list=model.COCO_LABELS_LIST)
 
         sensi_map = create_sensitivity_map(boxes_cont, scores_cont)
         
@@ -504,11 +510,9 @@ def validate_DAVIS(
 def main():
 
     data_root = "/data/DAVIS"
-    output_dir = "./output/contexted_inference_dino_swin"
+    output_dir = "./output/contexted_inference_lwdetr_xlarge"
 
-    model = DINO_4Scale_Swin_Contexted("cuda")
-    # model = DINO_5Scale_Swin_Contexted("cuda")
-    # model.load_weight("./ipconv/models/model_final_61ccd1.pkl")
+    model = LWDETR_xLarge_Contexted("cuda")
     model.eval()
 
     # sequence_names = sorted(os.listdir("/data/DAVIS/JPEGImages/480p"))

@@ -22,6 +22,8 @@ from timm.layers import DropPath, Mlp, trunc_normal_
 
 from ..util.box_ops import box_cxcywh_to_xyxy
 
+from typing import Dict
+
 
 def get_abs_pos(abs_pos, has_cls_token, hw):
     """
@@ -231,6 +233,30 @@ class Block(nn.Module):
         
         return x
 
+    def forward_contexted(
+        self,
+        x,
+        cache_prefix: str = "",
+        anchor_features: Dict[str, torch.Tensor] = {},
+        new_cache_features: Dict[str, torch.Tensor] = {},
+        dirtiness_map: torch.Tensor = torch.ones(1, 256, 256, 1, device="cuda")
+    ):
+        """
+        Contexted forward function for Block.
+        Args:
+            x: Input tensor [B, HW, C]
+            cache_prefix: String prefix for cache keys
+            anchor_features: Dict for anchor features (for caching)
+            new_cache_features: Dict for new cache features (for caching)
+            dirtiness_map: Tensor for dirty region mask (not used in this stub)
+        Returns:
+            x: Output tensor [B, HW, C]
+            new_cache_features: Updated cache features dict
+        """
+        # 실제 dirtiness_map 등은 사용하지 않고, 구조만 맞춤
+        x = self.forward(x)
+        return x, new_cache_features
+
 
 class ViT(nn.Module):
     """
@@ -376,3 +402,41 @@ class ViT(nn.Module):
                 
         # out = [torch.randn(1, 768, 64, 64, device=x.device)] * 4
         return out
+    
+    def forward_contexted(
+        self,
+        x,
+        cache_prefix: str = "",
+        anchor_features: Dict[str, torch.Tensor] = {},
+        new_cache_features: Dict[str, torch.Tensor] = {},
+        dirtiness_map: torch.Tensor = torch.ones(1, 256, 256, 1, device="cuda")
+    ):
+        x = self.patch_embed(x)
+
+        if self.pos_embed is not None:
+            if self._export:
+                x = x + self.pos_embed_export
+            else:
+                x = x + get_abs_pos(
+                    self.pos_embed, self.pretrain_use_cls_token, (x.shape[1], x.shape[2])
+                )
+
+        B, H, W, C = x.shape
+        assert (H % 4 == 0) and (W % 4 == 0)
+        h, w = H // 4, W // 4
+
+        x = x.reshape(B, 4, h, 4, w, C).permute(
+            0, 1, 3, 2, 4, 5).reshape(B * 16, h * w, C)
+        out = []
+        for idx, blk in enumerate(self.blocks):
+            x = blk.forward_contexted(
+                x, mask=None,
+                cache_prefix=f"{cache_prefix}.block.{idx}",
+                anchor_features=anchor_features,
+                new_cache_features=new_cache_features,
+                dirtiness_map=dirtiness_map
+            )
+            if self._out_features[idx]:
+                out.append(x.reshape(B, 4, 4, h, w, C).permute(
+                    0, 5, 1, 3, 2, 4).reshape(B, C, H, W))
+        return out, new_cache_features

@@ -359,6 +359,14 @@ class SwinTransformerBlock(nn.Module):
         dmap_windows = dmap_windows.view(-1, self.window_size * self.window_size, 1)  # nW*B, window_size*window_size, 1
         dmap_windows = dmap_windows.mean(dim=1, keepdim=True)  # nW*B, 1, 1
         dmap_windows = (dmap_windows > 0).float()  # nW*B, 1, 1
+        # if "layer.3" in cache_prefix:
+        #     dmap_windows = (dmap_windows > 0).float()  # nW*B, 1, 1
+        # else:
+        #     dmap_windows = (dmap_windows > 0.05).float()
+        if dmap_windows.sum().item() == 0:
+            # put random indices to dmap_windows
+            random_indices = torch.rand_like(dmap_windows[:, 0, 0]) < 0.1
+            dmap_windows[random_indices, 0, 0] = 1.0
         # print(f"{cache_prefix}: {dmap_windows.mean().item():.4f} dirtiness ratio")
 
         # W-MSA/SW-MSA
