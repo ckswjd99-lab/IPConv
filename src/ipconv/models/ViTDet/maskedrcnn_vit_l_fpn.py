@@ -293,10 +293,17 @@ class MaskedRCNN_ViT_L_FPN_Contexted(nn.Module):
             x_attn_selected = x_attn_flat[dmap_now_flat == 1, :]
             qkv_selected = block.attn.qkv(x_attn_selected)
 
-            qkv_flat = torch.zeros(B_attn * H_attn * W_attn, 3 * 1024, device=self.device, dtype=x_attn.dtype)
+            qkv_flat = torch.zeros(B_attn * H_attn * W_attn, 3 * self.embed_dim, device=self.device, dtype=x_attn.dtype)
             qkv_flat[dmap_now_flat == 1, :] = qkv_selected
 
             qkv = qkv_flat.reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # qkv with shape (3, B_attn, nHead, H_attn * W_attn, C)
+
+            fname = f"block{bidx}_qkv"
+            if fname in anchor_features:
+                dmap_channeled = dmap_now.reshape(B_attn, H_attn * W_attn)
+                dmap_broadcastable = dmap_channeled.unsqueeze(0).unsqueeze(2).unsqueeze(-1)
+                qkv = qkv * dmap_broadcastable + anchor_features[fname] * (1 - dmap_broadcastable)
+            new_cache_feature[fname] = qkv.clone()
 
             q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)  # q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
 
