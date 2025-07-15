@@ -11,6 +11,8 @@ import math
 
 import torch
 import torch.nn as nn
+from ipconv.models.ViTDet.count_base import dict_csv_header, dict_csv_line, dict_string
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
 
 from typing import List, Dict, Any, Tuple
 
@@ -26,6 +28,8 @@ from evaluate_funcs import (
 )
 from ipconv.models.ViTDet.modeling.backbone.utils import get_abs_pos
 
+outputs = []
+labels = []
 
 def evaluate_sequence(
     model: nn.Module,
@@ -37,8 +41,28 @@ def evaluate_sequence(
     """
     Evaluate the model on a single sequence of images.
     """
+    def squeeze_dict(x, dim=None):
+        out = {}
+        for key, value in x.items():
+            if isinstance(value, torch.Tensor):
+                if value.ndim > 1 and dim is not None and value.size(dim) == 1:
+                    out[key] = value.squeeze(dim)
+                elif value.ndim == 1:
+                    out[key] = value
+                else:
+                    out[key] = value  # 그대로 두기
+            else:
+                out[key] = value
+        return out
     
-    pbar = tqdm(enumerate(sequence_data))
+    def safe_tensor(array, shape, dtype):
+        return (
+            torch.from_numpy(array).reshape(shape).type(dtype)
+            if array.size > 0
+            else torch.empty(*shape, dtype=dtype)
+        )
+    
+    pbar = enumerate(sequence_data)
     img_sample = sequence_data[0][0]
     img_H, img_W = img_sample.shape[:2]
     input_img_size = (1024, 1024)
@@ -73,6 +97,8 @@ def evaluate_sequence(
         image: np.ndarray
         annotations: Dict[str, int]
 
+        if isinstance(image, torch.Tensor):
+            image = image.permute(1, 2, 0).cpu().numpy()
 
         ## REFRESH CHECK ##
         refresh = False
@@ -98,7 +124,7 @@ def evaluate_sequence(
         # > scale check
         if not refresh:
             scaling_factor = np.sqrt(np.linalg.det(placing_matrix[:2, :2]))
-            print(f"Scaling factor: {scaling_factor:.2f}")
+            #print(f"Scaling factor: {scaling_factor:.2f}")
             if scaling_factor < 0.8 or scaling_factor > 1.2:
                 refresh = True
 
@@ -189,17 +215,27 @@ def evaluate_sequence(
         # rolling shift the image with cum_shift_x and cum_shift_y
         vis_image = np.roll(vis_image, shift=(cum_shift_y * block_size, cum_shift_x * block_size), axis=(0, 1))
         
-        if ref_frame_aligned is not None:
-            cv2.imwrite(f"temp/{sequence_name}_{idx:04d}_ref.jpg", ref_frame_aligned)
+        #if ref_frame_aligned is not None:
+            #cv2.imwrite(f"temp/{sequence_name}_{idx:04d}_ref.jpg", ref_frame_aligned)
         cv2.imwrite(f"temp/{sequence_name}_{idx:04d}.jpg", vis_image)
-
-        print(f"Processed frame {idx} of sequence {sequence_name}, boxes: {len(boxes_cont)}")
 
         ref_frame = image.copy()
         ref_frame_aligned = image_placed.copy()
         frames_until_refresh -= 1
 
+
+        result = {
+            "boxes": safe_tensor(boxes_cont, (-1), torch.float32),
+            "labels": safe_tensor(labels_cont, (-1,), torch.int64),
+            "scores": safe_tensor(scores_cont, (-1,), torch.float32)
+        }
+
+        outputs.append(result)
+        label_dict = squeeze_dict(annotations, dim=0)
+        labels.append(label_dict)
+
     os.system(f"ffmpeg -framerate {frame_rate} -i temp/{sequence_name}_%04d.jpg -c:v libx264 -pix_fmt yuv420p temp/{sequence_name}_{frame_rate}fps.mp4 -y")
+    
 
 
 def evaluate(
@@ -212,23 +248,72 @@ def evaluate(
     Evaluate the model on the dataset at specified frame rates.
     """
     model.eval()
-    results = {}
-
-    for sequence_name, sequence_data in dataset.items():
+    model.counting()
+    model.clear_counts()
+    sequence_name = 0
+    n_frames = 0
+    for sequence_data in dataset:
         for frame_rate in frame_rates:
+
             print(f"Evaluating sequence: {sequence_name}, frame rate: {frame_rate} fps")
-            
+
             evaluate_sequence(model, sequence_name, sequence_data, frame_rate, **kwargs)
+            model.reset()
+            n_frames += len(sequence_data)
+            sequence_name += 1
+        # test here
+        if sequence_name == 2:
+            break
     
-    return results
+    mean_ap = MeanAveragePrecision()
+    mean_ap.update(outputs, labels)
+    metrics = mean_ap.compute()
+
+    counts = model.total_counts() / n_frames
+    model.clear_counts()
+    return {"metrics": metrics, "counts": counts}
 
 
 @torch.no_grad()
 def main(args):
+
+    def tee_print(s, file, flush=True):
+        print(s, flush=flush)
+        print(s, file=file, flush=flush)
+
+    def save_csv_results(results, output_dir, first_run=False):
+        for key, val in results.items():
+            with open(output_dir / f"{key}.csv", "a") as csv_file:
+                if first_run:
+                    print(dict_csv_header(val), file=csv_file)
+                print(dict_csv_line(val), file=csv_file)
+
+    def do_evaluation(title, results):
+        with open(output_dir / "output.txt", "a") as tee_file:
+
+            # Print and save results.
+            tee_print(title, tee_file)
+            if isinstance(results, dict):
+                save_csv_results(results, output_dir, first_run=(len(completed) == 0))
+                for key, val in results.items():
+                    tee_print(key.capitalize(), tee_file)
+                    tee_print(dict_string(val), tee_file)
+            else:
+                tee_print(results, tee_file)
+            tee_print("", tee_file)
+            completed.append(title)
+    
     model, dataset, settings_dict = prepare_environment(args)
 
     results = evaluate(model, dataset, args.frame_rates, **settings_dict)
 
+    completed = []
+    output_dir = Path("output")
+
+    print(results)
+    print("results")
+    do_evaluation("Vanilla", results)
+    
 
 def parse_int_list(value):
     """Parse comma-separated integers into a list."""

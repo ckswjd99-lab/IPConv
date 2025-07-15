@@ -5,14 +5,15 @@ from copy import deepcopy
 from pathlib import Path
 from sys import stderr
 
+
+from torchvision import transforms
+
+from random import Random
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 from torchvision.io import read_image
 
-import torchvision.transforms.functional as func
-from torchvision import transforms
-from random import Random
 
 CLASSES = [
     "airplane",
@@ -48,24 +49,6 @@ CLASSES = [
 ]
 
 SPLITS = ["det_train", "vid_train", "vid_val", "vid_minival"]
-
-
-def rescale(
-    x, scale, interpolation=transforms.InterpolationMode.BILINEAR, antialias=True
-):
-    if scale != 1.0:
-        x = func.resize(
-            x,
-            [round(scale * x.shape[-2]), round(scale * x.shape[-1])],
-            interpolation=interpolation,
-            antialias=antialias,
-        )
-    return x
-
-def seeded_shuffle(sequence, seed):
-    rng = Random()
-    rng.seed(seed)
-    rng.shuffle(sequence)
 
 
 class VID(Dataset):
@@ -120,6 +103,10 @@ class VID(Dataset):
         self.frames_path = Path(location, split, "frames")
         self.video_info = self._get_videos_info(location, split)
 
+        def seeded_shuffle(sequence, seed):
+            rng = Random()
+            rng.seed(seed)
+            rng.shuffle(sequence)
         # Optionally shuffle the videos (by default they are sorted).
         if shuffle:
             seeded_shuffle(self.video_info, shuffle_seed)
@@ -353,6 +340,18 @@ class VIDResize(nn.Module):
         self.short_edge_length = short_edge_length
         self.max_size = max_size
 
+    def rescale(
+        x, scale, interpolation=transforms.InterpolationMode.BILINEAR, antialias=True
+    ):
+        if scale != 1.0:
+            x = func.resize(
+                x,
+                [round(scale * x.shape[-2]), round(scale * x.shape[-1])],
+                interpolation=interpolation,
+                antialias=antialias,
+            )
+        return x
+    
     def forward(self, x):
         frame, annotations = x
         short_edge = min(frame.shape[-2:])

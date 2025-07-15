@@ -9,14 +9,17 @@ from tqdm import tqdm
 from pathlib import Path
 import math
 
+from collections import defaultdict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from typing import List, Dict, Any, Tuple
 
+from datasets.vid import VIDResize, VID
 from ipconv.models import (
-    MaskedRCNN_ViT_B_FPN_Contexted, MaskedRCNN_ViT_L_FPN_Contexted, MaskedRCNN_ViT_H_FPN_Contexted,
+    ViTDeT_b_Imagenet_Contexted, MaskedRCNN_ViT_B_FPN_Contexted, MaskedRCNN_ViT_L_FPN_Contexted, MaskedRCNN_ViT_H_FPN_Contexted,
     CascadeMaskRCNN_Swin_B_Contexted, DINO_4Scale_Swin_Contexted, DINO_5Scale_Swin_Contexted,
     LWDETR_xLarge_Contexted
 )
@@ -29,7 +32,7 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
 
     # Prepare model
     models_dict = {
-        "vitdet-b": MaskedRCNN_ViT_B_FPN_Contexted,
+        "vitdet-b": ViTDeT_b_Imagenet_Contexted,
         "vitdet-l": MaskedRCNN_ViT_L_FPN_Contexted,
         "vitdet-h": MaskedRCNN_ViT_H_FPN_Contexted,
         "dino-swin4": DINO_4Scale_Swin_Contexted,
@@ -37,7 +40,7 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
     }
 
     models_weight_dict = {
-        "vitdet-b": "./ipconv/models/model_final_61ccd1.pkl",
+        "vitdet-b": "./ipconv/models/frcnn_vitdet_final.pth",
         "vitdet-l": "./ipconv/models/model_final_6146ed.pkl",
         "vitdet-h": "./ipconv/models/model_final_7224f1.pkl"
     }
@@ -76,7 +79,17 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
     model = models_dict[args.model]()
 
     if args.model in models_weight_dict:
-        model.load_weight(models_weight_dict[args.model])
+        weight_path = models_weight_dict[args.model]
+        weights = torch.load(weight_path, map_location='cpu')  # 또는 'cuda' 필요 시
+
+        model_state = model.state_dict()        
+        weights_state = weights["model"] if "model" in weights else weights
+        adjusted_weights_state = {f"base_model.{k}": v for k, v in weights_state.items()}
+
+        filtered_ckpt = {k: v for k, v in adjusted_weights_state.items() if k in model_state}
+
+        model.load_state_dict(filtered_ckpt, strict=False)
+        print(f"✅ Loaded {len(filtered_ckpt)} keys")
 
     settings_dict = models_settings_dict[args.model] if args.model in models_settings_dict else {}
     
@@ -119,11 +132,14 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
             dataset_dict[sequence_name] = list(zip(seq_images, annotations))
 
     if args.dataset == "imnet-vid":
-        data_root = "/data/vid_data/vid/vid_val/frames"
+        data_root = "/home/nxclab/data/vid/vid_val/frames"
+        dataset_dict = VID(
+        Path("/home/nxclab/data", "vid"),
+        split="vid_val",
+        tar_path=Path("/home/nxclab/data", "vid", "vid_data.tar")
+        )
+        
 
-        print("ImageNet-VID val not implemented yet.")
-        sys.exit(1)
-    
     return model, dataset_dict, settings_dict
 
 
