@@ -169,10 +169,10 @@ def evaluate_sequence(
 
         ## VISUALIZE ##
         # > Draw the full border
-        cv2.rectangle(image_placed, (0, 0), (input_img_size[0], input_img_size[1]), (0, 255, 255), 2)
+        vis_image = image_placed.copy()
+        cv2.rectangle(vis_image, (0, 0), (input_img_size[0], input_img_size[1]), (0, 255, 255), 2)
 
         # > Boost the dirtiness map
-        vis_image = image_placed.copy()
         dmap_recompute = dmap_recompute.squeeze().cpu().numpy()
         dmap_recompute = cv2.resize(dmap_recompute, (input_img_size[0], input_img_size[1]), interpolation=cv2.INTER_NEAREST)
         vis_image[:, :, 1] = np.clip(vis_image[:, :, 1] + dmap_recompute * 30, 0, 255)

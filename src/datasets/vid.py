@@ -5,7 +5,7 @@ from copy import deepcopy
 from pathlib import Path
 from sys import stderr
 
-
+import torchvision.transforms.functional as func
 from torchvision import transforms
 
 from random import Random
@@ -339,20 +339,20 @@ class VIDResize(nn.Module):
         super().__init__()
         self.short_edge_length = short_edge_length
         self.max_size = max_size
-
-    def rescale(
-        x, scale, interpolation=transforms.InterpolationMode.BILINEAR, antialias=True
-    ):
-        if scale != 1.0:
-            x = func.resize(
-                x,
-                [round(scale * x.shape[-2]), round(scale * x.shape[-1])],
-                interpolation=interpolation,
-                antialias=antialias,
-            )
-        return x
     
     def forward(self, x):
+
+        def rescale(
+            x, scale, interpolation=transforms.InterpolationMode.BILINEAR, antialias=True
+        ):
+            if scale != 1.0:
+                x = func.resize(
+                    x,
+                    [round(scale * x.shape[-2]), round(scale * x.shape[-1])],
+                    interpolation=interpolation,
+                    antialias=antialias,
+                )
+            return x
         frame, annotations = x
         short_edge = min(frame.shape[-2:])
         long_edge = max(frame.shape[-2:])

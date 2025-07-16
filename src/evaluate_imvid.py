@@ -11,7 +11,7 @@ import math
 
 import torch
 import torch.nn as nn
-from ipconv.models.ViTDet.count_base import dict_csv_header, dict_csv_line, dict_string
+from ipconv.models.ViTDet.eventful_transformer.base import dict_csv_header, dict_csv_line, dict_string
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 
 from typing import List, Dict, Any, Tuple
@@ -41,19 +41,6 @@ def evaluate_sequence(
     """
     Evaluate the model on a single sequence of images.
     """
-    def squeeze_dict(x, dim=None):
-        out = {}
-        for key, value in x.items():
-            if isinstance(value, torch.Tensor):
-                if value.ndim > 1 and dim is not None and value.size(dim) == 1:
-                    out[key] = value.squeeze(dim)
-                elif value.ndim == 1:
-                    out[key] = value
-                else:
-                    out[key] = value  # 그대로 두기
-            else:
-                out[key] = value
-        return out
     
     def safe_tensor(array, shape, dtype):
         return (
@@ -192,13 +179,13 @@ def evaluate_sequence(
         # > Create sensitivity map
         sensitivity_map = create_sensitivity_map(boxes_cont, scores_cont, input_img_size)
         
-
+        
         ## VISUALIZE ##
         # > Draw the full border
-        cv2.rectangle(image_placed, (0, 0), (input_img_size[0], input_img_size[1]), (0, 255, 255), 2)
+        vis_image = image_placed.copy()
+        cv2.rectangle(vis_image, (0, 0), (input_img_size[0], input_img_size[1]), (0, 255, 255), 2)
 
         # > Boost the dirtiness map
-        vis_image = image_placed.copy()
         dmap_recompute = dmap_recompute.squeeze().cpu().numpy()
         dmap_recompute = cv2.resize(dmap_recompute, (input_img_size[0], input_img_size[1]), interpolation=cv2.INTER_NEAREST)
         vis_image[:, :, 1] = np.clip(vis_image[:, :, 1] + dmap_recompute * 30, 0, 255)
@@ -215,27 +202,55 @@ def evaluate_sequence(
         # rolling shift the image with cum_shift_x and cum_shift_y
         vis_image = np.roll(vis_image, shift=(cum_shift_y * block_size, cum_shift_x * block_size), axis=(0, 1))
         
-        #if ref_frame_aligned is not None:
-            #cv2.imwrite(f"temp/{sequence_name}_{idx:04d}_ref.jpg", ref_frame_aligned)
+        if ref_frame_aligned is not None:
+            cv2.imwrite(f"temp/{sequence_name}_{idx:04d}_ref.jpg", ref_frame_aligned)
         cv2.imwrite(f"temp/{sequence_name}_{idx:04d}.jpg", vis_image)
 
         ref_frame = image.copy()
         ref_frame_aligned = image_placed.copy()
         frames_until_refresh -= 1
+        
+        # affine predicted bounding box
+        def inverse_affine_boxes(transformed_boxes, placing_matrix):
+            inverse_affine = np.linalg.inv(placing_matrix)[:2, :]
+
+            restored_boxes = []
+            for box in transformed_boxes:
+                x1, y1, x2, y2 = box
+
+                point_lt = np.array([x1, y1], dtype=np.float32).reshape(-1, 1, 2)
+                point_rt = np.array([x2, y1], dtype=np.float32).reshape(-1, 1, 2)
+                point_lb = np.array([x1, y2], dtype=np.float32).reshape(-1, 1, 2)
+                point_rb = np.array([x2, y2], dtype=np.float32).reshape(-1, 1, 2)
+
+                src_pts = np.concatenate([point_lt, point_rt, point_lb, point_rb], axis=0)
+                dst_pts = cv2.transform(src_pts, inverse_affine)
+
+                x_min = int(np.mean(dst_pts[[0, 2], 0, 0]))
+                y_min = int(np.mean(dst_pts[[0, 1], 0, 1]))
+                x_max = int(np.mean(dst_pts[[1, 3], 0, 0]))
+                y_max = int(np.mean(dst_pts[[2, 3], 0, 1]))
+
+                restored_boxes.append([x_min, y_min, x_max, y_max])
+            return restored_boxes
+        
+        boxes_affined = inverse_affine_boxes(boxes_cont, placing_matrix)
+        boxes_affined = np.array(boxes_affined, dtype=np.float32)
 
 
         result = {
-            "boxes": safe_tensor(boxes_cont, (-1), torch.float32),
+            "boxes": safe_tensor(boxes_affined, (-1, 4), torch.float32),
             "labels": safe_tensor(labels_cont, (-1,), torch.int64),
             "scores": safe_tensor(scores_cont, (-1,), torch.float32)
         }
 
         outputs.append(result)
-        label_dict = squeeze_dict(annotations, dim=0)
-        labels.append(label_dict)
+        gt_boxes = annotations["boxes"].reshape(-1, 4)
+        gt_labels = annotations["labels"].reshape(-1)
+        labels.append({"boxes": gt_boxes, "labels": gt_labels})
 
     os.system(f"ffmpeg -framerate {frame_rate} -i temp/{sequence_name}_%04d.jpg -c:v libx264 -pix_fmt yuv420p temp/{sequence_name}_{frame_rate}fps.mp4 -y")
-    
+
 
 
 def evaluate(
@@ -260,12 +275,13 @@ def evaluate(
             evaluate_sequence(model, sequence_name, sequence_data, frame_rate, **kwargs)
             model.reset()
             n_frames += len(sequence_data)
-            sequence_name += 1
+
+        sequence_name += 1
         # test here
         if sequence_name == 2:
             break
-    
-    mean_ap = MeanAveragePrecision()
+
+    mean_ap = MeanAveragePrecision(box_format='xyxy')
     mean_ap.update(outputs, labels)
     metrics = mean_ap.compute()
 
@@ -302,7 +318,19 @@ def main(args):
                 tee_print(results, tee_file)
             tee_print("", tee_file)
             completed.append(title)
-    
+
+            # Save pred_outputs.pt
+            save_path = Path("output/pred_outputs.pt")
+            cpu_outputs = []
+            for d in outputs:
+                cpu_outputs.append({
+                    "boxes":  d["boxes"].cpu(),   # shape (N,4)
+                    "labels": d["labels"].cpu(),  # shape (N,)
+                    "scores": d["scores"].cpu()   # shape (N,)
+                })
+            torch.save(cpu_outputs, save_path)
+            print(f"Saved {len(cpu_outputs)} predictions to {save_path}")
+                
     model, dataset, settings_dict = prepare_environment(args)
 
     results = evaluate(model, dataset, args.frame_rates, **settings_dict)
@@ -310,8 +338,6 @@ def main(args):
     completed = []
     output_dir = Path("output")
 
-    print(results)
-    print("results")
     do_evaluation("Vanilla", results)
     
 

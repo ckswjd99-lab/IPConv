@@ -2,7 +2,7 @@ from collections import defaultdict
 from sys import stdout
 
 from torch import nn as nn
-
+import torch
 
 class Counts(defaultdict):
     """
@@ -168,16 +168,23 @@ def dict_csv_header(x):
 
     :param x: A dict
     """
-    return ",".join(k for k in sorted(x.keys()))
+    return ",".join(k for k in sorted(x.keys()) if k!= "classes")
 
 
 def dict_csv_line(x):
-    """
-    Returns a CSV-content string containing the values of a dict.
+    def safe_format(v):
+        if isinstance(v, torch.Tensor):
+            if v.ndim == 0:
+                return f"{v.item():g}"
+            else:
+                return "[" + ";".join(f"{i:g}" for i in v.flatten().tolist()) + "]"
+        elif isinstance(v, float):
+            return f"{v:g}"
+        else:
+            return str(v)
 
-    :param x: A dict
-    """
-    return ",".join(f"{x[k]:g}" for k in sorted(x.keys()))
+    return ",".join(safe_format(x[k]) for k in sorted(x.keys()) if k != "classes")
+
 
 
 def dict_string(x, indent=4, value_format=".4g"):
@@ -188,8 +195,20 @@ def dict_string(x, indent=4, value_format=".4g"):
     :param value_format: Number format for count values
     """
     lines = []
+    if not x:
+        return "Empty dictionary."
+
     key_length = max(len(str(key)) for key in x.keys())
-    format_str = " " * indent + f"{{:<{key_length + 1}}} {{:{value_format}}}"
+    key_format = " " * indent + f"{{:<{key_length + 1}}} {{}}"
+
     for key in sorted(x.keys()):
-        lines.append(format_str.format(f"{key}:", x[key]))
+        val = x[key]
+        if isinstance(val, torch.Tensor) and val.numel() == 1:
+            val = val.item()
+        if isinstance(val, (float, int)):
+            val_str = f"{val:{value_format}}"
+        else:
+            val_str = str(val)
+        lines.append(key_format.format(f"{key}:", val_str))
+
     return "\n".join(lines)

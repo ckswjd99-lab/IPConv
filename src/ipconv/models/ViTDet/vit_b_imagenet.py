@@ -32,7 +32,7 @@ from .modeling.roi_heads import (
     FastRCNNConvFCHead,
 )
 
-from .count_base import ExtendedModule
+from .eventful_transformer.base import ExtendedModule
 from .structures import ImageList
 from .layers import ShapeSpec
 from .layers.wrappers import move_device_like, shapes_to_tensor

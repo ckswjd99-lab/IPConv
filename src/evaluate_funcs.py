@@ -132,11 +132,13 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
             dataset_dict[sequence_name] = list(zip(seq_images, annotations))
 
     if args.dataset == "imnet-vid":
-        data_root = "/home/nxclab/data/vid/vid_val/frames"
         dataset_dict = VID(
         Path("/home/nxclab/data", "vid"),
         split="vid_val",
-        tar_path=Path("/home/nxclab/data", "vid", "vid_data.tar")
+        tar_path=Path("/home/nxclab/data", "vid", "vid_data.tar"),
+        combined_transform=VIDResize(
+            short_edge_length=640, max_size=1024
+        ),
         )
         
 
@@ -298,6 +300,9 @@ def create_dirtiness_map(
 
     dirtiness_map = torch.from_numpy(dirtiness_map)
     dirtiness_map = dirtiness_map.unsqueeze(0).unsqueeze(-1)
+
+    if dirtiness_map.sum() == 0:
+        dirtiness_map[0, 0, 0, 0] = 1
 
     return dirtiness_map
 
