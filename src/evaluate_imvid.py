@@ -206,6 +206,8 @@ def evaluate_sequence(
             cv2.imwrite(f"temp/{sequence_name}_{idx:04d}_ref.jpg", ref_frame_aligned)
         cv2.imwrite(f"temp/{sequence_name}_{idx:04d}.jpg", vis_image)
 
+        #print(f"Processed frame {idx} of sequence {sequence_name}, boxes: {len(boxes_cont)}")
+
         ref_frame = image.copy()
         ref_frame_aligned = image_placed.copy()
         frames_until_refresh -= 1
@@ -277,9 +279,6 @@ def evaluate(
             n_frames += len(sequence_data)
 
         sequence_name += 1
-        # test here
-        if sequence_name == 2:
-            break
 
     mean_ap = MeanAveragePrecision(box_format='xyxy')
     mean_ap.update(outputs, labels)

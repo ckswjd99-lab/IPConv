@@ -37,6 +37,12 @@ def evaluate_sequence(
     """
     Evaluate the model on a single sequence of images.
     """
+    def safe_tensor(array, shape, dtype):
+        return (
+            torch.from_numpy(array).reshape(shape).type(dtype)
+            if array.size > 0
+            else torch.empty(*shape, dtype=dtype)
+        )
     
     pbar = tqdm(enumerate(sequence_data))
     img_sample = sequence_data[0][0]
@@ -193,11 +199,48 @@ def evaluate_sequence(
             cv2.imwrite(f"temp/{sequence_name}_{idx:04d}_ref.jpg", ref_frame_aligned)
         cv2.imwrite(f"temp/{sequence_name}_{idx:04d}.jpg", vis_image)
 
-        print(f"Processed frame {idx} of sequence {sequence_name}, boxes: {len(boxes_cont)}")
+        #print(f"Processed frame {idx} of sequence {sequence_name}, boxes: {len(boxes_cont)}")
 
         ref_frame = image.copy()
         ref_frame_aligned = image_placed.copy()
         frames_until_refresh -= 1
+
+        # affine predicted bounding box
+        def inverse_affine_boxes(transformed_boxes, placing_matrix):
+            inverse_affine = np.linalg.inv(placing_matrix)[:2, :]
+
+            restored_boxes = []
+            for box in transformed_boxes:
+                x1, y1, x2, y2 = box
+
+                point_lt = np.array([x1, y1], dtype=np.float32).reshape(-1, 1, 2)
+                point_rt = np.array([x2, y1], dtype=np.float32).reshape(-1, 1, 2)
+                point_lb = np.array([x1, y2], dtype=np.float32).reshape(-1, 1, 2)
+                point_rb = np.array([x2, y2], dtype=np.float32).reshape(-1, 1, 2)
+
+                src_pts = np.concatenate([point_lt, point_rt, point_lb, point_rb], axis=0)
+                dst_pts = cv2.transform(src_pts, inverse_affine)
+
+                x_min = int(np.mean(dst_pts[[0, 2], 0, 0]))
+                y_min = int(np.mean(dst_pts[[0, 1], 0, 1]))
+                x_max = int(np.mean(dst_pts[[1, 3], 0, 0]))
+                y_max = int(np.mean(dst_pts[[2, 3], 0, 1]))
+
+                restored_boxes.append([x_min, y_min, x_max, y_max])
+            return restored_boxes
+        
+        boxes_affined = inverse_affine_boxes(boxes_cont, placing_matrix)
+        boxes_affined = np.array(boxes_affined, dtype=np.float32)
+
+        result = {
+            "boxes": safe_tensor(boxes_affined, (-1, 4), torch.float32),
+            "labels": safe_tensor(labels_cont, (-1,), torch.int64),
+            "scores": safe_tensor(scores_cont, (-1,), torch.float32)
+        }
+
+        outputs.append(result)
+
+
 
     os.system(f"ffmpeg -framerate {frame_rate} -i temp/{sequence_name}_%04d.jpg -c:v libx264 -pix_fmt yuv420p temp/{sequence_name}_{frame_rate}fps.mp4 -y")
 

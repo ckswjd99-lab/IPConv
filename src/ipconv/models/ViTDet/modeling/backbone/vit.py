@@ -16,7 +16,7 @@ from .fpn import _assert_strides_are_log2_contiguous
 from .backbone import Backbone
 from .utils import (
     PatchEmbed,
-    add_decomposed_rel_pos,
+    AddDecomposedRelPos,
     get_abs_pos,
     window_partition,
     window_unpartition,
@@ -58,6 +58,7 @@ class Attention(ExtendedModule):
         self.qkv = CountedLinear(in_features=dim, out_features=dim * 3)
         self.proj = CountedLinear(in_features=dim, out_features=dim)
         self.matmul = CountedMatmul()
+        self.rel_pos_module = AddDecomposedRelPos()
         self.use_rel_pos = use_rel_pos
         if self.use_rel_pos:
             # initialize relative positional embeddings
@@ -78,7 +79,7 @@ class Attention(ExtendedModule):
         attn = self.matmul((q * self.scale), k.transpose(-2, -1))
 
         if self.use_rel_pos:
-            attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+            attn = self.rel_pos_module(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
 
         attn = attn.softmax(dim=-1)
         x = self.matmul(attn, v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
