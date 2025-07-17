@@ -137,7 +137,7 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
         split="vid_val",
         tar_path=Path("/home/nxclab/data", "vid", "vid_data.tar"),
         combined_transform=VIDResize(
-            short_edge_length=640, max_size=1024
+            short_edge_length=640, max_size=int(1024 * 0.9)
         ),
         )
         

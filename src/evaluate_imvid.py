@@ -51,7 +51,7 @@ def evaluate_sequence(
     
     pbar = enumerate(sequence_data)
     img_sample = sequence_data[0][0]
-    img_H, img_W = img_sample.shape[:2]
+    img_H, img_W = img_sample.shape[1:]
     input_img_size = (1024, 1024)
     block_size = 16
     background_color = kwargs.get("background_color", (0, 0, 0))
