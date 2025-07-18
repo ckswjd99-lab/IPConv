@@ -36,6 +36,10 @@ def evaluate_sequence(
     sequence_name: str,
     sequence_data: List[Tuple[torch.Tensor, Dict[str, int]]],
     frame_rate: int,
+    dmap_type: str = "threshold",
+    dirty_thres: int = 30,
+    dirty_topk: int = 100,
+    sensi_expansion: int = 1,
     **kwargs: Any
 ):
     """
@@ -149,7 +153,10 @@ def evaluate_sequence(
         dmap = create_dirtiness_map(
             anchor_image=ref_frame_aligned,
             current_image=image_placed,
-            block_size=block_size
+            block_size=block_size,
+            dmap_type=dmap_type,
+            dirty_thres=dirty_thres,
+            dirty_topk=dirty_topk
         ).to("cuda") if not refresh else torch.ones(1, 64, 64, 1, device="cuda")
         dmap_ndarray = dmap.squeeze().cpu().numpy()
         dmap_ndarray = cv2.resize(dmap_ndarray, (input_img_size[0], input_img_size[1]), interpolation=cv2.INTER_NEAREST)
@@ -162,7 +169,7 @@ def evaluate_sequence(
 
         # > Expand the sensitive area
         if sensitivity_map is not None:
-            dmap_expanded = expand_mask_neighbors(dmap).cpu().numpy().squeeze(0).squeeze(-1)
+            dmap_expanded = expand_mask_neighbors(dmap, sensi_expansion).cpu().numpy().squeeze(0).squeeze(-1)
             sensi_map_downsized = cv2.resize(sensitivity_map, (input_img_size[0] // block_size, input_img_size[1] // block_size), interpolation=cv2.INTER_AREA)
             sensi_map_downsized = (sensi_map_downsized > 0.5).astype(np.float32)
             dmap_expanded = dmap_expanded * sensi_map_downsized + dmap.squeeze().cpu().numpy() * (1 - sensi_map_downsized)
@@ -259,6 +266,10 @@ def evaluate(
     model, 
     dataset: Dict[str, List[Tuple[torch.Tensor, Dict[str, int]]]],
     frame_rates: List[int],
+    dmap_type: str = "threshold",
+    dirty_thres: int = 30,
+    dirty_topk: int = 100,
+    sensi_expansion: int = 1,
     **kwargs: Any
 ):
     """
@@ -274,7 +285,7 @@ def evaluate(
 
             print(f"Evaluating sequence: {sequence_name}, frame rate: {frame_rate} fps")
 
-            evaluate_sequence(model, sequence_name, sequence_data, frame_rate, **kwargs)
+            evaluate_sequence(model, sequence_name, sequence_data, frame_rate, dmap_type, dirty_thres, dirty_topk, sensi_expansion, **kwargs)
             model.reset()
             n_frames += len(sequence_data)
 
@@ -332,7 +343,7 @@ def main(args):
                 
     model, dataset, settings_dict = prepare_environment(args)
 
-    results = evaluate(model, dataset, args.frame_rates, **settings_dict)
+    results = evaluate(model, dataset, args.frame_rates, args.dmap_type, args.dirty_thres, args.dirty_topk, args.sensi_expansion, **settings_dict)
 
     completed = []
     output_dir = Path("output")
@@ -360,6 +371,14 @@ if __name__ == "__main__":
                        help="Frame rate(s) for evaluation. Comma-separated integers (e.g., 1,6,100).")
     parser.add_argument("--sequence", type=parse_str_list, default=["bear"], 
                        help="Specific sequence(s) to evaluate on. Comma-separated strings (e.g., bear,camel). If None, evaluates on all sequences.")
+    parser.add_argument("--dmap_type", type=str, choices=["threshold", "topk"], default="threshold",
+                       help="Type of dirtiness map to use. 'threshold' for thresholding, 'topk' for top-k dirtiness.")
+    parser.add_argument("--dirty_thres", type=int, default=30, nargs="?",
+                       help="Dirtiness threshold for the dirtiness map. Default is 30.")
+    parser.add_argument("--dirty-topk", type=int, default=100, nargs="?",
+                       help="Top-k dirtiness for the dirtiness map. Default is 100.")
+    parser.add_argument("--sensi-expansion", type=int, default=1,
+                       help="Expansion factor for the sensitivity map. Default is 1.")
     args = parser.parse_args()
 
     main(args)

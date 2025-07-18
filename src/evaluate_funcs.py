@@ -274,7 +274,9 @@ def create_dirtiness_map(
     anchor_image: np.ndarray, 
     current_image: np.ndarray,
     block_size: int = 16,
+    dmap_type: str = "threshold",
     dirty_thres: int = 30,
+    dirty_topk: int = 100,
     chromakey: np.ndarray = np.array([123.675, 116.28, 103.53], dtype=np.uint8),
     sensi_map: np.ndarray = None,
 ) -> torch.Tensor:
@@ -289,28 +291,38 @@ def create_dirtiness_map(
     image_H, image_W = residual.shape[:2]
     
     dirtiness_map = cv2.GaussianBlur(dirtiness_map, (15, 15), 1.5)
-    if sensi_map is None:
+
+    if sensi_map is not None:
+        dirtiness_map = dirtiness_map / (1 - sensi_map + 1e-6)
+
+    if dmap_type == "threshold":
         dirtiness_map = (dirtiness_map > dirty_thres).astype(np.float32)
-    else:
-        dirtiness_map = (dirtiness_map > dirty_thres * (1 - sensi_map)).astype(np.float32)
+        dirtiness_map = cv2.GaussianBlur(dirtiness_map, (15, 15), 1.5)
+        dirtiness_map = cv2.resize(dirtiness_map, (image_W // block_size, image_H // block_size), interpolation=cv2.INTER_LINEAR)
+        dirtiness_map = (dirtiness_map > 0).astype(np.float32)
 
-    dirtiness_map = cv2.GaussianBlur(dirtiness_map, (15, 15), 1.5)
-    dirtiness_map = cv2.resize(dirtiness_map, (image_W // block_size, image_H // block_size), interpolation=cv2.INTER_LINEAR)
-    dirtiness_map = (dirtiness_map > 0).astype(np.float32)
-
-    dirtiness_map = torch.from_numpy(dirtiness_map)
-    dirtiness_map = dirtiness_map.unsqueeze(0).unsqueeze(-1)
+        dirtiness_map = torch.from_numpy(dirtiness_map)
+        dirtiness_map = dirtiness_map.unsqueeze(0).unsqueeze(-1)
+    elif dmap_type == "topk":
+        dirtiness_map = cv2.resize(dirtiness_map, (image_W // block_size, image_H // block_size), interpolation=cv2.INTER_AREA)
+        # make top k elements in dirtiness_map to 1, others to 0
+        flat_map = dirtiness_map.flatten()
+        topk_indices = np.argpartition(flat_map, -dirty_topk)[-dirty_topk:]
+        topk_values = flat_map[topk_indices]
+        threshold = topk_values.min()
+        dirtiness_map = (dirtiness_map >= threshold).astype(np.float32)
 
     if dirtiness_map.sum() == 0:
         dirtiness_map[0, 0, 0, 0] = 1
 
     return dirtiness_map
 
-def expand_mask_neighbors(mask_4d: torch.Tensor) -> torch.Tensor:
+def expand_mask_neighbors(mask_4d: torch.Tensor, expansion: int = 1) -> torch.Tensor:
     mask_4d = mask_4d.permute(0, 3, 1, 2)  # (1, 1, 64, 64)
-    kernel = torch.ones((1, 1, 3, 3), device=mask_4d.device, dtype=mask_4d.dtype)
+    ksize = 2 * expansion + 1
+    kernel = torch.ones((1, 1, ksize, ksize), device=mask_4d.device, dtype=mask_4d.dtype)
     
-    expanded = F.conv2d(mask_4d, kernel, padding=1)
+    expanded = F.conv2d(mask_4d, kernel, padding=expansion)
     expanded = (expanded > 0).float()
     expanded = expanded.permute(0, 2, 3, 1)
     
