@@ -302,7 +302,6 @@ def evaluate(
 
 @torch.no_grad()
 def main(args):
-
     def tee_print(s, file, flush=True):
         print(s, flush=flush)
         print(s, file=file, flush=flush)
@@ -316,8 +315,6 @@ def main(args):
 
     def do_evaluation(title, results):
         with open(output_dir / "output.txt", "a") as tee_file:
-
-            # Print and save results.
             tee_print(title, tee_file)
             if isinstance(results, dict):
                 save_csv_results(results, output_dir, first_run=(len(completed) == 0))
@@ -329,26 +326,29 @@ def main(args):
             tee_print("", tee_file)
             completed.append(title)
 
-            # Save pred_outputs.pt
-            save_path = Path("output/pred_outputs.pt")
+            save_path = output_dir / "pred_outputs.pt"
             cpu_outputs = []
             for d in outputs:
                 cpu_outputs.append({
-                    "boxes":  d["boxes"].cpu(),   # shape (N,4)
-                    "labels": d["labels"].cpu(),  # shape (N,)
-                    "scores": d["scores"].cpu()   # shape (N,)
+                    "boxes":  d["boxes"].cpu(),
+                    "labels": d["labels"].cpu(),
+                    "scores": d["scores"].cpu()
                 })
             torch.save(cpu_outputs, save_path)
             print(f"Saved {len(cpu_outputs)} predictions to {save_path}")
-                
+
     model, dataset, settings_dict = prepare_environment(args)
 
     results = evaluate(model, dataset, args.frame_rates, args.dmap_type, args.dirty_thres, args.dirty_topk, args.sensi_expansion, **settings_dict)
 
     completed = []
-    output_dir = Path("output")
+    frame_rate_str = f"{args.frame_rates[0]}fps"
+    dirtiness_key = f"thres{args.dirty_thres}" if args.dmap_type == "threshold" else f"topk{args.dirty_topk}"
+    output_dir = Path("output") / frame_rate_str / dirtiness_key
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     do_evaluation("Vanilla", results)
+
     
 
 def parse_int_list(value):
