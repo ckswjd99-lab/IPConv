@@ -40,7 +40,7 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
     }
 
     models_weight_dict = {
-        "vitdet-b": "./ipconv/models/frcnn_vitdet_final.pth",
+        "vitdet-b": "weights/frcnn_vitdet_final.pth",
         "vitdet-l": "./ipconv/models/model_final_6146ed.pkl",
         "vitdet-h": "./ipconv/models/model_final_7224f1.pkl"
     }
@@ -91,6 +91,9 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
         model.load_state_dict(filtered_ckpt, strict=False)
         print(f"✅ Loaded {len(filtered_ckpt)} keys")
 
+        model = model.to("cuda")
+
+
     settings_dict = models_settings_dict[args.model] if args.model in models_settings_dict else {}
     
     # Prepare dataset
@@ -133,9 +136,9 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
 
     if args.dataset == "imnet-vid":
         dataset_dict = VID(
-        Path("/home/nxclab/data", "vid"),
+        Path("data", "vid"),
         split="vid_val",
-        tar_path=Path("/home/nxclab/data", "vid", "vid_data.tar"),
+        tar_path=Path("data", "vid", "vid_data.tar"),
         combined_transform=VIDResize(
             short_edge_length=640, max_size=int(1024 * 0.9)
         ),
@@ -158,7 +161,7 @@ def estimate_affine(prev_nd, curr_nd):
     p1, st, _ = cv2.calcOpticalFlowPyrLK(prev_g, curr_g, p0, None,
                                          winSize=LK_WIN, maxLevel=3)
     ok = st.squeeze() == 1
-    if ok.sum() < 6: return np.eye(2, 3, np.float32)
+    if ok.sum() < 6: return np.eye(2, 3, dtype=np.float32)
     T, _ = cv2.estimateAffinePartial2D(p1[ok], p0[ok], method=cv2.LMEDS)
 
     T[0,2] /= DOWNSCALE;  T[1,2] /= DOWNSCALE
@@ -318,6 +321,10 @@ def create_dirtiness_map(
     return dirtiness_map
 
 def expand_mask_neighbors(mask_4d: torch.Tensor, expansion: int = 1) -> torch.Tensor:
+    if mask_4d.dim() == 2:
+        mask_4d = mask_4d.unsqueeze(0).unsqueeze(-1)
+    elif mask_4d.dim() == 3:
+        mask_4d = mask_4d.unsqueeze(-1)
     mask_4d = mask_4d.permute(0, 3, 1, 2)  # (1, 1, 64, 64)
     ksize = 2 * expansion + 1
     kernel = torch.ones((1, 1, ksize, ksize), device=mask_4d.device, dtype=mask_4d.dtype)

@@ -1,0 +1,10 @@
+nohup: ignoring input
+✅ Loaded 229 keys
+Evaluating sequence: 0, frame rate: 100 fps
+/usr/local/lib/python3.10/dist-packages/torch/functional.py:507: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at ../aten/src/ATen/native/TensorShape.cpp:3549.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+Evaluating sequence: 1, frame rate: 100 fps
+Evaluating sequence: 2, frame rate: 100 fps
+Evaluating sequence: 3, frame rate: 100 fps
+Evaluating sequence: 4, frame rate: 100 fps
+Evaluating sequence: 5, frame rate: 100 fps

@@ -150,14 +150,26 @@ def evaluate_sequence(
                 sensitivity_map = np.roll(sensitivity_map, shift=(-shift_y * block_size, -shift_x * block_size), axis=(0, 1))
         
         # > Create dirtiness map and sensitivity map
-        dmap = create_dirtiness_map(
-            anchor_image=ref_frame_aligned,
-            current_image=image_placed,
-            block_size=block_size,
-            dmap_type=dmap_type,
-            dirty_thres=dirty_thres,
-            dirty_topk=dirty_topk
-        ).to("cuda") if not refresh else torch.ones(1, 64, 64, 1, device="cuda")
+        if not refresh:
+            dmap_raw = create_dirtiness_map(
+                anchor_image=ref_frame_aligned,
+                current_image=image_placed,
+                block_size=block_size,
+                dmap_type=dmap_type,
+                dirty_thres=dirty_thres,
+                dirty_topk=dirty_topk
+            )
+
+            if isinstance(dmap_raw, np.ndarray):
+                dmap = torch.from_numpy(dmap_raw).to("cuda")
+            elif isinstance(dmap_raw, torch.Tensor):
+                dmap = dmap_raw.to("cuda")
+            else:
+                raise TypeError("Unsupported type for dirtiness map")
+        else:
+            dmap = torch.ones(1, 64, 64, 1, device="cuda")
+
+        
         dmap_ndarray = dmap.squeeze().cpu().numpy()
         dmap_ndarray = cv2.resize(dmap_ndarray, (input_img_size[0], input_img_size[1]), interpolation=cv2.INTER_NEAREST)
         dmap_ndarray = np.repeat(dmap_ndarray[:, :, np.newaxis], 3, axis=2)
@@ -186,7 +198,7 @@ def evaluate_sequence(
         # > Create sensitivity map
         sensitivity_map = create_sensitivity_map(boxes_cont, scores_cont, input_img_size)
         
-        
+        '''
         ## VISUALIZE ##
         # > Draw the full border
         vis_image = image_placed.copy()
@@ -210,11 +222,11 @@ def evaluate_sequence(
         vis_image = np.roll(vis_image, shift=(cum_shift_y * block_size, cum_shift_x * block_size), axis=(0, 1))
         
         if ref_frame_aligned is not None:
-            cv2.imwrite(f"temp/{sequence_name}_{idx:04d}_ref.jpg", ref_frame_aligned)
-        cv2.imwrite(f"temp/{sequence_name}_{idx:04d}.jpg", vis_image)
+            cv2.imwrite(f"temp/{sequence_name}_{idx:04d}_ref.jpg", ref_frame_aligned[:, :, ::-1])
+        cv2.imwrite(f"temp/{sequence_name}_{idx:04d}.jpg", vis_image[:, :, ::-1])
 
         #print(f"Processed frame {idx} of sequence {sequence_name}, boxes: {len(boxes_cont)}")
-
+        '''
         ref_frame = image.copy()
         ref_frame_aligned = image_placed.copy()
         frames_until_refresh -= 1
@@ -258,7 +270,7 @@ def evaluate_sequence(
         gt_labels = annotations["labels"].reshape(-1)
         labels.append({"boxes": gt_boxes, "labels": gt_labels})
 
-    os.system(f"ffmpeg -framerate {frame_rate} -i temp/{sequence_name}_%04d.jpg -c:v libx264 -pix_fmt yuv420p temp/{sequence_name}_{frame_rate}fps.mp4 -y")
+    #os.system(f"ffmpeg -framerate {frame_rate} -i temp/{sequence_name}_%04d.jpg -c:v libx264 -pix_fmt yuv420p temp/{sequence_name}_{frame_rate}fps.mp4 -y")
 
 
 
