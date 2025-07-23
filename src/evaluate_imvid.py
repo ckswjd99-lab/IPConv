@@ -47,11 +47,13 @@ def evaluate_sequence(
     """
     
     def safe_tensor(array, shape, dtype):
-        return (
-            torch.from_numpy(array).reshape(shape).type(dtype)
-            if array.size > 0
-            else torch.empty(*shape, dtype=dtype)
-        )
+        if array.size > 0:
+            return torch.from_numpy(array).reshape(shape).type(dtype)
+        else:
+            # shape 내 -1을 0으로 바꿔서 empty tensor를 안전하게 생성
+            safe_shape = tuple(0 if s == -1 else s for s in shape)
+            return torch.empty(*safe_shape, dtype=dtype)
+
     
     pbar = enumerate(sequence_data)
     img_sample = sequence_data[0][0]
@@ -294,12 +296,16 @@ def evaluate(
     n_frames = 0
     for sequence_data in dataset:
         for frame_rate in frame_rates:
+            try:
+                print(f"Evaluating sequence: {sequence_name}, frame rate: {frame_rate} fps")
 
-            print(f"Evaluating sequence: {sequence_name}, frame rate: {frame_rate} fps")
+                evaluate_sequence(model, sequence_name, sequence_data, frame_rate, dmap_type, dirty_thres, dirty_topk, sensi_expansion, **kwargs)
+                model.reset()
+                n_frames += len(sequence_data)
 
-            evaluate_sequence(model, sequence_name, sequence_data, frame_rate, dmap_type, dirty_thres, dirty_topk, sensi_expansion, **kwargs)
-            model.reset()
-            n_frames += len(sequence_data)
+            except Exception as e:
+                print(f"[Error] sequence {sequence_name}, frame rate {frame_rate} fps: {e}")
+                break
 
         sequence_name += 1
 

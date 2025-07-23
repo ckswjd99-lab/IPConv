@@ -100,7 +100,7 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
     img_max_size = int(1024 * 0.8) // 2 * 2
 
     if args.dataset == "davis":
-        data_root = "/data/DAVIS/"
+        data_root = "data/DAVIS/"
         frames_path = os.path.join(data_root, "JPEGImages/480p")
 
         dataset_dict = {}
@@ -112,7 +112,7 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
         
         for sequence_name in sequences:
             sequence_path = f"{frames_path}/{sequence_name}"
-            annotations_path = os.path.join(data_root, "Annotations_bbox/480p", f"{sequence_name}.json")
+            annotations_path = os.path.join(data_root, "Annotations/480p", f"{sequence_name}.json")
 
             seq_images = []
 
