@@ -221,12 +221,23 @@ def refresh_placing_matrix(placing_matrix, img_H, img_W, input_img_size, block_s
     return False, placing_matrix, (shift_x, shift_y)
 
 
-def shift_anchor_features(anchor_features: dict, shift_x: int, shift_y: int, ape: torch.Tensor = None) -> dict:
+def shift_anchor_features(
+        anchor_features: dict, 
+        shift_x: int, 
+        shift_y: int, 
+        ape: torch.Tensor = None,
+        k_pe: Dict[str, torch.Tensor] = None,
+        v_pe: Dict[str, torch.Tensor] = None
+) -> dict:
     """
     anchor_features의 모든 qkv/out 텐서를 shift_x, shift_y만큼 블록 단위로 이동시킴.
     """
     for key, value in anchor_features.items():
-        if "qkv" in key:
+        if "qkv" in key and "qkvpe" not in key:
+            bidx = int(key.split("block")[-1].split("_")[0])
+            x_std = anchor_features.get(f"block{bidx}_std", None).mean()
+            qkvpe = anchor_features.get(f"block{bidx}_qkvpe", None)
+
             num_windows = value.shape[1]
             num_hw = value.shape[3]
 
@@ -236,11 +247,22 @@ def shift_anchor_features(anchor_features: dict, shift_x: int, shift_y: int, ape
             key_reshaped = value.view(
                 value.shape[0], sqrt_num_windows, sqrt_num_windows, value.shape[2],
                 sqrt_num_hw, sqrt_num_hw, value.shape[4]
-            )
+            )   # (3, sqrt_num_windows, sqrt_num_windows, num_heads, H, W, C)
             key_reshaped = key_reshaped.permute(0, 1, 4, 2, 5, 3, 6).contiguous().view(
                 value.shape[0], sqrt_num_windows * sqrt_num_hw, sqrt_num_windows * sqrt_num_hw, value.shape[2], value.shape[4]
+            )   # (3, real_H, real_W, num_heads, C)
+
+            pe_reshaped = qkvpe.view(
+                qkvpe.shape[0], sqrt_num_windows, sqrt_num_windows, qkvpe.shape[2],
+                sqrt_num_hw, sqrt_num_hw, qkvpe.shape[4]
+            ).permute(0, 1, 4, 2, 5, 3, 6).contiguous().view(
+                value.shape[0], sqrt_num_windows * sqrt_num_hw, sqrt_num_windows * sqrt_num_hw, value.shape[2], value.shape[4]
             )
+
+            key_reshaped -= pe_reshaped / x_std
             key_reshaped = key_reshaped.roll(shifts=(-shift_y, -shift_x), dims=(1, 2))
+            key_reshaped += pe_reshaped / x_std
+
             key_reshaped = key_reshaped.view(
                 value.shape[0], sqrt_num_windows, sqrt_num_hw, sqrt_num_windows, sqrt_num_hw, value.shape[2], value.shape[4]
             )

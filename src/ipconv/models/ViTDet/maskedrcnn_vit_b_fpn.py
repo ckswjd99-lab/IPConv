@@ -271,10 +271,11 @@ class MaskedRCNN_ViT_B_FPN_Contexted(ExtendedModule):
 
         # > ViT
         x = net.patch_embed(images.tensor)
+        ape = get_abs_pos(
+            net.pos_embed, net.pretrain_use_cls_token, (x.shape[1], x.shape[2])
+        )
         if net.pos_embed is not None:
-            x = self.add(x, get_abs_pos(
-                net.pos_embed, net.pretrain_use_cls_token, (x.shape[1], x.shape[2])
-            ))
+            x = self.add(x, ape)
         
         # x: Tensor(1, 64, 64, 768)
         # dirtiness_map: Tensor(1, 64, 64, 1)
@@ -283,6 +284,8 @@ class MaskedRCNN_ViT_B_FPN_Contexted(ExtendedModule):
         for bidx, block in enumerate(net.blocks):
             # > EncoderBlock
             shortcut = x
+
+            x_std = torch.std(x, dim=-1, keepdim=True)
             x = block.norm1(x)
 
             # Window partition
@@ -319,6 +322,22 @@ class MaskedRCNN_ViT_B_FPN_Contexted(ExtendedModule):
                 dmap_broadcastable = dmap_channeled.unsqueeze(0).unsqueeze(2).unsqueeze(-1)
                 qkv = self.add(qkv * dmap_broadcastable, anchor_features[fname] * (1 - dmap_broadcastable))
             new_cache_feature[fname] = qkv.clone()
+
+            fname = f"block{bidx}_qkvpe"
+            if fname in anchor_features:
+                new_cache_feature[fname] = anchor_features[fname]
+            else:
+                if block.window_size > 0:
+                    ape_block, _ = window_partition(ape, block.window_size)
+                else:
+                    ape_block = ape
+                ape_block = block.attn.qkv(ape_block).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # ape_block with shape (3, B_attn, nHead, H_attn * W_attn, C)
+                
+                new_cache_feature[fname] = ape_block.clone()
+
+            fname = f"block{bidx}_std"
+            x_std, _ = window_partition(x_std, block.window_size) if block.window_size > 0 else (x_std, None)
+            new_cache_feature[fname] = x_std.clone()
 
             q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)  # q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
 
