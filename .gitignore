@@ -174,4 +174,4 @@ output
 data
 *.pkl
 *.pth
-temp
+tempdavis/
