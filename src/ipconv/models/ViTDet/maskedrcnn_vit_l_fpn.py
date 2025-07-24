@@ -15,7 +15,7 @@ from tqdm import tqdm
 from typing import List, Optional, Dict, Tuple, Union
 
 from .modeling.backbone.vit import ViT, SimpleFeaturePyramid
-from .modeling.backbone.utils import get_abs_pos, window_partition, window_unpartition, add_decomposed_rel_pos, partial_mlp_inference, expand_mask_neighbors
+from .modeling.backbone.utils import get_abs_pos, window_partition, window_unpartition, AddDecomposedRelPos, add_decomposed_rel_pos, partial_mlp_inference, expand_mask_neighbors
 from .modeling.backbone.fpn import LastLevelMaxPool, ShapeSpec
 
 from .modeling.meta_arch import GeneralizedRCNN
@@ -32,7 +32,8 @@ from .modeling.roi_heads import (
     FastRCNNConvFCHead,
 )
 
-
+from .eventful_transformer.base import ExtendedModule
+from .eventful_transformer.counting import CountedAdd, CountedMatmul
 from .structures import ImageList
 from .layers import ShapeSpec
 from .layers.wrappers import move_device_like, shapes_to_tensor
@@ -44,7 +45,7 @@ from ..proc_image import (
 
 fidx = 0
 
-class MaskedRCNN_ViT_L_FPN_Contexted(nn.Module):
+class MaskedRCNN_ViT_L_FPN_Contexted(ExtendedModule):
     def __init__(self, device="cuda"):
         super().__init__()
         self.idx = 0
@@ -106,6 +107,11 @@ class MaskedRCNN_ViT_L_FPN_Contexted(nn.Module):
             norm="LN",
             square_pad=1024,
         ).to(self.device)
+
+        # counting module
+        self.add = CountedAdd()
+        self.matmul = CountedMatmul()
+        self.add_decomposed_rel_pos = AddDecomposedRelPos()
 
         # model
         self.base_model = GeneralizedRCNN(
@@ -257,9 +263,9 @@ class MaskedRCNN_ViT_L_FPN_Contexted(nn.Module):
         # > ViT
         x = net.patch_embed(images.tensor)
         if net.pos_embed is not None:
-            x = x + get_abs_pos(
+            x = self.add(x, get_abs_pos(
                 net.pos_embed, net.pretrain_use_cls_token, (x.shape[1], x.shape[2])
-            )
+            ))
         
         # x: Tensor(1, 64, 64, 1024)
         # dirtiness_map: Tensor(1, 64, 64, 1)
@@ -302,21 +308,21 @@ class MaskedRCNN_ViT_L_FPN_Contexted(nn.Module):
             if fname in anchor_features:
                 dmap_channeled = dmap_now.reshape(B_attn, H_attn * W_attn)
                 dmap_broadcastable = dmap_channeled.unsqueeze(0).unsqueeze(2).unsqueeze(-1)
-                qkv = qkv * dmap_broadcastable + anchor_features[fname] * (1 - dmap_broadcastable)
+                qkv = self.add(qkv * dmap_broadcastable, anchor_features[fname] * (1 - dmap_broadcastable))
             new_cache_feature[fname] = qkv.clone()
 
             q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)  # q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
 
             # partial attention
             if bidx in self.window_block_indexes:   # window attention
-                attn = (q * block.attn.scale) @ k.transpose(-2, -1)
+                attn = self.matmul((q * block.attn.scale), k.transpose(-2, -1))
 
                 if block.attn.use_rel_pos:
-                    attn = add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn))
+                    attn = self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn))
 
                 # projection
                 attn = attn.softmax(dim=-1)
-                x_attn = (attn @ v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
+                x_attn = self.matmul(attn, v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
 
                 x_attn_flat = x_attn.reshape(-1, x_attn.shape[-1])
                 x_attn_selected = x_attn_flat[dmap_now_flat == 1, :]
@@ -329,16 +335,16 @@ class MaskedRCNN_ViT_L_FPN_Contexted(nn.Module):
                 q_selected = q[:, dmap_now_flat == 1, :]
                 num_selected = q_selected.shape[1]
 
-                attn_selected = (q_selected * block.attn.scale) @ k.transpose(-2, -1)
+                attn_selected = self.matmul((q_selected * block.attn.scale), k.transpose(-2, -1))
                 attn = torch.zeros(B_attn * block.attn.num_heads, H_attn * W_attn, H_attn * W_attn, device=self.device, dtype=x_attn.dtype)
                 attn[:, dmap_now_flat == 1, :] = attn_selected
 
                 if block.attn.use_rel_pos:
-                    attn = add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn), dmap_now)
+                    attn = self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn), dmap_now)
 
                 # projection
                 attn_selected = attn[:, dmap_now_flat == 1, :].softmax(dim=-1)
-                x_attn_selected = (attn_selected @ v).view(B_attn, block.attn.num_heads, num_selected, -1).permute(0, 2, 1, 3).reshape(B_attn, num_selected, -1)
+                x_attn_selected = self.matmul(attn_selected, v).view(B_attn, block.attn.num_heads, num_selected, -1).permute(0, 2, 1, 3).reshape(B_attn, num_selected, -1)
                 x_attn_selected = block.attn.proj(x_attn_selected)
 
                 x_attn = torch.zeros(B_attn, H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=x_attn.dtype)
@@ -352,7 +358,7 @@ class MaskedRCNN_ViT_L_FPN_Contexted(nn.Module):
                 x = window_unpartition(x, block.window_size, pad_hw, (H, W))
 
             # Residual
-            x = shortcut + block.drop_path(x)
+            x = self.add(shortcut, block.drop_path(x))
 
             shortcut2 = x
             x_norm2 = block.norm2(x)
@@ -363,7 +369,7 @@ class MaskedRCNN_ViT_L_FPN_Contexted(nn.Module):
                 block.mlp, 
                 block.drop_path
             )
-            x = shortcut2 + x_mlp_out
+            x = self.add(shortcut2, x_mlp_out)
 
 
             if block.use_residual_block:    # nothing
@@ -372,8 +378,8 @@ class MaskedRCNN_ViT_L_FPN_Contexted(nn.Module):
             fname = f"block{bidx}_out"
             if fname in anchor_features:
                 # x: (1, 64, 64, 1024), anchor_features[fname]: (1, 64, 64, 1024)
-                dmap_channeled = dmap_block.expand(-1, -1, -1, x.shape[-1])    # (1, 64, 64, 1024)
-                x = x * dmap_channeled + anchor_features[fname] * (1 - dmap_channeled)
+                dmap_channeled = dmap_block.expand(-1, -1, -1, x.shape[-1])    # (1, 64, 64, 768)
+                x = self.add(x * dmap_channeled, anchor_features[fname] * (1 - dmap_channeled))
             new_cache_feature[fname] = x.clone()
 
         if only_backbone:
@@ -446,7 +452,8 @@ class MaskedRCNN_ViT_L_FPN_Contexted(nn.Module):
         labels = predictions["instances"].pred_classes.cpu().numpy()
         scores = predictions["instances"].scores.cpu().numpy()
 
+        pred_masks = predictions["instances"].pred_masks.cpu().numpy()  # (N, H, W)
         # boxes, labels, scores = [], [], []
 
-        return (boxes, labels, scores), new_cache_feature
+        return (boxes, labels, scores), new_cache_feature, pred_masks
     

@@ -8,6 +8,7 @@ import json
 from tqdm import tqdm
 from pathlib import Path
 import math
+import pickle
 
 from collections import defaultdict
 
@@ -32,7 +33,7 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
 
     # Prepare model
     models_dict = {
-        "vitdet-b": ViTDeT_b_Imagenet_Contexted,
+        "vitdet-b": MaskedRCNN_ViT_B_FPN_Contexted,  #이 부분!
         "vitdet-l": MaskedRCNN_ViT_L_FPN_Contexted,
         "vitdet-h": MaskedRCNN_ViT_H_FPN_Contexted,
         "dino-swin4": DINO_4Scale_Swin_Contexted,
@@ -40,9 +41,9 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
     }
 
     models_weight_dict = {
-        "vitdet-b": "weights/frcnn_vitdet_final.pth",
-        "vitdet-l": "./ipconv/models/model_final_6146ed.pkl",
-        "vitdet-h": "./ipconv/models/model_final_7224f1.pkl"
+        "vitdet-b": "./weights/model_final_61ccd1.pkl",  # 이 부분!
+        "vitdet-l": "./weights/model_final_6146ed.pkl",
+        "vitdet-h": "./weights/model_final_7224f1.pkl"
     }
 
     models_settings_dict = {
@@ -80,16 +81,32 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
 
     if args.model in models_weight_dict:
         weight_path = models_weight_dict[args.model]
-        weights = torch.load(weight_path, map_location='cpu')  # 또는 'cuda' 필요 시
+        ext = os.path.splitext(weight_path)[-1].lower()
 
-        model_state = model.state_dict()        
-        weights_state = weights["model"] if "model" in weights else weights
-        adjusted_weights_state = {f"base_model.{k}": v for k, v in weights_state.items()}
+        if ext == '.pkl':
+            with open(weight_path, 'rb') as f:
+                weights = pickle.load(f)
+        else:
+            weights = torch.load(weight_path, map_location='cpu')
 
-        filtered_ckpt = {k: v for k, v in adjusted_weights_state.items() if k in model_state}
+        model_state = model.state_dict()
+
+        if isinstance(weights, dict) and "model" in weights:
+            weights_state = weights["model"]
+        else:
+            weights_state = weights
+
+        adjusted_weights_state = {
+            f"base_model.{k}": torch.tensor(v) if isinstance(v, np.ndarray) else v
+            for k, v in weights_state.items()
+        }
+
+        filtered_ckpt = {
+            k: v for k, v in adjusted_weights_state.items() if k in model_state
+        }
 
         model.load_state_dict(filtered_ckpt, strict=False)
-        print(f"✅ Loaded {len(filtered_ckpt)} keys")
+        print(f"✅ Loaded {len(filtered_ckpt)} keys (converted from numpy if needed)")
 
         model = model.to("cuda")
 
@@ -106,33 +123,42 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
         dataset_dict = {}
 
         if args.sequence is None:
-            sequences = [seq for seq in os.listdir(data_root) if os.path.isdir(os.path.join(data_root, seq))]
+            sequences = [seq for seq in os.listdir(frames_path) if os.path.isdir(os.path.join(frames_path, seq))]
         else:
             sequences = args.sequence
-        
+
         for sequence_name in sequences:
-            sequence_path = f"{frames_path}/{sequence_name}"
-            annotations_path = os.path.join(data_root, "Annotations/480p", f"{sequence_name}.json")
+            sequence_path = os.path.join(frames_path, sequence_name)
+            annotations_path = os.path.join(data_root, "Annotations/480p", sequence_name)
 
             seq_images = []
+            seq_masks = []
 
-            for img_name in sorted(os.listdir(sequence_path)):
-                img_loaded = cv2.imread(os.path.join(sequence_path, img_name))
-                
+            # 이미지와 마스크 파일을 정렬하여 짝맞춤
+            img_names = sorted(os.listdir(sequence_path))
+            mask_names = sorted(os.listdir(annotations_path))
+
+            for img_name, mask_name in zip(img_names, mask_names):
+                img_path = os.path.join(sequence_path, img_name)
+                mask_path = os.path.join(annotations_path, mask_name)
+
+                img_loaded = cv2.imread(img_path)
+                if img_loaded is None:
+                    print(f"[Warning] Failed to load image: {img_path}")
+                    continue
+
                 img_scaled = cv2.resize(
-                    img_loaded, 
+                    img_loaded,
                     dsize=None,
-                    fx=img_max_size/max(img_loaded.shape[:2]),
-                    fy=img_max_size/max(img_loaded.shape[:2]),
+                    fx=img_max_size / max(img_loaded.shape[:2]),
+                    fy=img_max_size / max(img_loaded.shape[:2]),
                     interpolation=cv2.INTER_LINEAR
                 )
                 seq_images.append(img_scaled)
-            
-            with open(annotations_path, "r") as f:
-                annotations = json.load(f)
-                annotations = [annotations[frame_name] for frame_name in sorted(annotations.keys())]
+                seq_masks.append(mask_path)
 
-            dataset_dict[sequence_name] = list(zip(seq_images, annotations))
+            dataset_dict[sequence_name] = list(zip(seq_images, seq_masks))
+
 
     if args.dataset == "imnet-vid":
         dataset_dict = VID(

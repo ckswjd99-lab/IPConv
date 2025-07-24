@@ -8,11 +8,18 @@ import json
 from tqdm import tqdm
 from pathlib import Path
 import math
+import imageio
 
 import torch
 import torch.nn as nn
 
+import sys, os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+
 from typing import List, Dict, Any, Tuple
+from davis.davis2017.metrics import db_eval_iou, db_eval_boundary
+
 
 from evaluate_funcs import (
     prepare_environment,
@@ -24,8 +31,11 @@ from evaluate_funcs import (
     create_sensitivity_map,
     expand_mask_neighbors
 )
+from ipconv.models.ViTDet.eventful_transformer.base import dict_string
 from ipconv.models.ViTDet.modeling.backbone.utils import get_abs_pos
 
+J_list = []
+F_list = []
 
 def evaluate_sequence(
     model: nn.Module,
@@ -146,9 +156,9 @@ def evaluate_sequence(
                 anchor_image=ref_frame_aligned,
                 current_image=image_placed,
                 block_size=block_size,
-                dmap_type=dmap_type,
-                dirty_thres=dirty_thres,
-                dirty_topk=dirty_topk
+                dmap_type=args.dmap_type,
+                dirty_thres=args.dirty_thres,
+                dirty_topk=args.dirty_topk
             )
 
             if isinstance(dmap_raw, np.ndarray):
@@ -181,14 +191,14 @@ def evaluate_sequence(
 
 
         ## INFERENCE ##
-        (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(image_placed, cached_features_dict, dmap_recompute)
+        (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_contexted(image_placed, cached_features_dict, dmap_recompute)
 
         
         ## POSTPROCESS ##
         # > Create sensitivity map
         sensitivity_map = create_sensitivity_map(boxes_cont, scores_cont, input_img_size)
         
-
+        '''
         ## VISUALIZE ##
         # > Draw the full border
         vis_image = image_placed.copy()
@@ -216,49 +226,74 @@ def evaluate_sequence(
         cv2.imwrite(f"temp/{sequence_name}_{idx:04d}.jpg", vis_image[:, :, ::-1])
 
         #print(f"Processed frame {idx} of sequence {sequence_name}, boxes: {len(boxes_cont)}")
-
+        '''
         ref_frame = image.copy()
         ref_frame_aligned = image_placed.copy()
         frames_until_refresh -= 1
 
-        # affine predicted bounding box
-        def inverse_affine_boxes(transformed_boxes, placing_matrix):
+        # affine predicted masks
+        def save_segmentation_mask(
+            pred_masks: np.ndarray,           # (N, H, W)
+            placing_matrix: np.ndarray,       # 3x3 or 2x3 affine matrix
+            output_shape: Tuple[int, int],    # (H, W) of original image
+            save_path: str,
+            score_thresh: float = 0.5
+        ):
             inverse_affine = np.linalg.inv(placing_matrix)[:2, :]
 
-            restored_boxes = []
-            for box in transformed_boxes:
-                x1, y1, x2, y2 = box
+            composite_mask = np.zeros(output_shape, dtype=np.uint8)  # (H, W)
 
-                point_lt = np.array([x1, y1], dtype=np.float32).reshape(-1, 1, 2)
-                point_rt = np.array([x2, y1], dtype=np.float32).reshape(-1, 1, 2)
-                point_lb = np.array([x1, y2], dtype=np.float32).reshape(-1, 1, 2)
-                point_rb = np.array([x2, y2], dtype=np.float32).reshape(-1, 1, 2)
+            for i, mask in enumerate(pred_masks):
+                # (optional) threshold if mask is float
+                mask = (mask > score_thresh).astype(np.uint8) * 255
 
-                src_pts = np.concatenate([point_lt, point_rt, point_lb, point_rb], axis=0)
-                dst_pts = cv2.transform(src_pts, inverse_affine)
+                warped_mask = cv2.warpAffine(
+                    mask,
+                    inverse_affine,
+                    dsize=(output_shape[1], output_shape[0]),
+                    flags=cv2.INTER_NEAREST,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0
+                )
 
-                x_min = int(np.mean(dst_pts[[0, 2], 0, 0]))
-                y_min = int(np.mean(dst_pts[[0, 1], 0, 1]))
-                x_max = int(np.mean(dst_pts[[1, 3], 0, 0]))
-                y_max = int(np.mean(dst_pts[[2, 3], 0, 1]))
+                composite_mask[warped_mask > 127] = i + 1
 
-                restored_boxes.append([x_min, y_min, x_max, y_max])
-            return restored_boxes
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            imageio.imwrite(save_path, composite_mask)
         
-        boxes_affined = inverse_affine_boxes(boxes_cont, placing_matrix)
-        boxes_affined = np.array(boxes_affined, dtype=np.float32)
-
-        result = {
-            "boxes": safe_tensor(boxes_affined, (-1, 4), torch.float32),
-            "labels": safe_tensor(labels_cont, (-1,), torch.int64),
-            "scores": safe_tensor(scores_cont, (-1,), torch.float32)
-        }
-
-        outputs.append(result)
+        frame_name = f"{idx:05d}"
+        output_mask_path = f"./pred_masks_davis/{sequence_name}/{frame_name}.png"
 
 
+        original_shape = (img_H, img_W)  # image.shape[:2] before placing
 
-    os.system(f"ffmpeg -framerate {frame_rate} -i temp/{sequence_name}_%04d.jpg -c:v libx264 -pix_fmt yuv420p temp/{sequence_name}_{frame_rate}fps.mp4 -y")
+        save_segmentation_mask(
+            pred_masks=pred_masks,                   # (N, H, W)
+            placing_matrix=placing_matrix, 
+            output_shape=original_shape,            # (H, W)
+            save_path=output_mask_path
+        )
+
+        gt = cv2.imread(annotations, 0)
+        pred = cv2.imread(output_mask_path, 0)
+
+        img_max_size = int(1024 * 0.8) // 2 * 2
+        scale_factor = img_max_size / max(gt.shape[:2])
+        gt = cv2.resize(
+            gt,
+            dsize=None,
+            fx=scale_factor,
+            fy=scale_factor,
+            interpolation=cv2.INTER_NEAREST
+        )
+
+        j = db_eval_iou(gt, pred)
+        f = db_eval_boundary(gt, pred)
+
+        J_list.append(j)
+        F_list.append(f)
+
+    #os.system(f"ffmpeg -framerate {frame_rate} -i temp/{sequence_name}_%04d.jpg -c:v libx264 -pix_fmt yuv420p temp/{sequence_name}_{frame_rate}fps.mp4 -y")
 
 
 def evaluate(
@@ -271,22 +306,53 @@ def evaluate(
     Evaluate the model on the dataset at specified frame rates.
     """
     model.eval()
-    results = {}
+    model.counting()
+    model.clear_counts()
+    n_frames = 0
 
     for sequence_name, sequence_data in dataset.items():
         for frame_rate in frame_rates:
             print(f"Evaluating sequence: {sequence_name}, frame rate: {frame_rate} fps")
-            
             evaluate_sequence(model, sequence_name, sequence_data, frame_rate, **kwargs)
+            model.reset()
+            n_frames += len(sequence_data)
     
-    return results
+    counts = model.total_counts() / n_frames
+    model.clear_counts()
+
+    return {"counts": counts}
+    
 
 
 @torch.no_grad()
 def main(args):
+    def tee_print(s, file, flush=True):
+        print(s, flush=flush)
+        print(s, file=file, flush=flush)
+
     model, dataset, settings_dict = prepare_environment(args)
 
-    results = evaluate(model, dataset, args.frame_rates, **settings_dict)
+    counts = evaluate(model, dataset, args.frame_rates, **settings_dict)
+
+    model_name = f"{args.model}"
+    frame_rate_str = f"{args.frame_rates[0]}fps"
+    dirtiness_key = f"thres{args.dirty_thres}" if args.dmap_type == "threshold" else f"topk{args.dirty_topk}"
+    output_dir = Path("output/davis") / model_name / frame_rate_str / dirtiness_key
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 2. 평균 계산
+    mean_J = np.mean(J_list)
+    mean_F = np.mean(F_list)
+
+    # 3. 파일로 저장
+    with open(output_dir / "mean_JF.txt", "w") as tee_file:
+        tee_file.write(f"Mean J: {mean_J:.4f}\n")
+        tee_file.write(f"Mean F: {mean_F:.4f}\n")
+        for key, val in counts.items():
+            tee_print(key.capitalize(), tee_file)
+            tee_print(dict_string(val), tee_file)
+
+    print(f"[Saved] Mean J and F written to {output_dir / 'mean_JF.txt'}")
 
 
 def parse_int_list(value):
@@ -299,16 +365,22 @@ def parse_str_list(value):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate a model on a dataset.")
-    parser.add_argument("--model", type=str, default="vitdet-b", help="Model to use for evaluation.",
+    parser.add_argument("--model", type=str, default="vitdet-h", help="Model to use for evaluation.",
         choices=["vitdet-b", "vitdet-l", "vitdet-h", "dino-swin4", "lwdetr"],
     )
-    parser.add_argument("--dataset", type=str, default="imnet-vid", help="Dataset to evaluate on.",
+    parser.add_argument("--dataset", type=str, default="davis", help="Dataset to evaluate on.",
         choices=["davis", "imnet-vid"],
     )
     parser.add_argument("--frame-rates", type=parse_int_list, default=[100], 
                        help="Frame rate(s) for evaluation. Comma-separated integers (e.g., 1,6,100).")
-    parser.add_argument("--sequence", type=parse_str_list, default=["bear"], 
+    parser.add_argument("--sequence", type=parse_str_list, default=None, 
                        help="Specific sequence(s) to evaluate on. Comma-separated strings (e.g., bear,camel). If None, evaluates on all sequences.")
+    parser.add_argument("--dmap_type", type=str, choices=["threshold", "topk"], default="threshold",
+                       help="Type of dirtiness map to use. 'threshold' for thresholding, 'topk' for top-k dirtiness.")
+    parser.add_argument("--dirty_thres", type=int, default=30, nargs="?",
+                       help="Dirtiness threshold for the dirtiness map. Default is 30.")
+    parser.add_argument("--dirty-topk", type=int, default=100, nargs="?",
+                       help="Top-k dirtiness for the dirtiness map. Default is 100.")
     args = parser.parse_args()
 
     main(args)
