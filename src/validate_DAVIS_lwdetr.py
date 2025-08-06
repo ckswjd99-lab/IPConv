@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from typing import Dict, Tuple, List
 
-from ipconv.models import LWDETR_xLarge_Contexted
+from ipconv.models import LWDETR_xLarge_Contexted, LWDETR_Small_Contexted
 from ipconv.models.proc_image import visualize_detection, calculate_multi_iou
 from ipconv.models.constants import COCO_LABELS_LIST
 from ipconv.models.ViTDet.modeling.backbone.utils import expand_mask_neighbors, shrink_mask_neighbors
@@ -378,9 +378,9 @@ def validate_DAVIS(
             (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(current_image_padded)
 
             # print maximum confident box
-            if len(boxes_cont) > 0:
-                max_score_idx = np.argmax(scores_cont)
-                print(f"Maximum confident box: {boxes_cont[max_score_idx]}, score: {scores_cont[max_score_idx]}")
+            # if len(boxes_cont) > 0:
+            #     max_score_idx = np.argmax(scores_cont)
+            #     print(f"Maximum confident box: {boxes_cont[max_score_idx]}, score: {scores_cont[max_score_idx]}")
             
             # dmap_dummy = (torch.randn(1, 256, 256, 1, device="cuda") > 0).float()
             # (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(
@@ -512,7 +512,8 @@ def main():
     data_root = "/data/DAVIS"
     output_dir = "./output/contexted_inference_lwdetr_xlarge"
 
-    model = LWDETR_xLarge_Contexted("cuda")
+    # model = LWDETR_xLarge_Contexted("cuda")
+    model = LWDETR_Small_Contexted("cuda")
     model.eval()
 
     # sequence_names = sorted(os.listdir("/data/DAVIS/JPEGImages/480p"))
@@ -520,7 +521,7 @@ def main():
     sequence_names = ["bear", "camel", "skate-park", "tuk-tuk"]
     # sequence_names = ["bear"]
     # gops = [1, 2, 3, 6, 30, 100]
-    gops = [30]
+    gops = [1]
 
     log_text = "Sequence, "
     for gop in gops:

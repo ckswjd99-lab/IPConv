@@ -6,3 +6,4 @@ from .ViTDet.cascade_mask_rcnn_swin_b import CascadeMaskRCNN_Swin_B_Contexted
 from .DINO.dino_4scale_swin import DINO_4Scale_Swin_Contexted
 from .DINO.dino_5scale_swin import DINO_5Scale_Swin_Contexted
 from .LW_DETR.lwdetr_xlarge import LWDETR_xLarge_Contexted
+from .LW_DETR.lwdetr_small import LWDETR_Small_Contexted
