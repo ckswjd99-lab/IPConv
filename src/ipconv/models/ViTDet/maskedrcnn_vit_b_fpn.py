@@ -243,6 +243,10 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
     ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], Dict[str, torch.Tensor]]:
         # image_ndarray: (H, W, C)
 
+        dmap_bool = dirtiness_map.squeeze().bool()  # (64, 64)
+        dmap_flat = dmap_bool.flatten()  # (4096,)
+        dmap_index = torch.nonzero(dmap_flat, as_tuple=False).squeeze(1)  # [N_dirty], long tensor
+
         new_cache_feature = {}
         
         # convert to tensor
@@ -299,11 +303,15 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
 
             # partial QKV generation
             x_attn_flat = x_attn.reshape(-1, self.embed_dim)
-            x_attn_selected = x_attn_flat[dmap_now_flat == 1, :]
+            
+            # Use F.embedding for sparse selection instead of boolean indexing
+            dirty_indices = torch.nonzero(dmap_now_flat, as_tuple=False).to(x_attn_flat.device).squeeze(1)
+            x_attn_selected = F.embedding(dirty_indices, x_attn_flat)
             qkv_selected = block.attn.qkv(x_attn_selected)
-
+            
+            # Use F.embedding for sparse assignment
             qkv_flat = torch.zeros(B_attn * H_attn * W_attn, 3 * self.embed_dim, device=self.device, dtype=x_attn.dtype)
-            qkv_flat[dmap_now_flat == 1, :] = qkv_selected
+            qkv_flat.index_copy_(0, dirty_indices, qkv_selected)
 
             qkv = qkv_flat.reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # qkv with shape (3, B_attn, nHead, H_attn * W_attn, C)
 
@@ -327,32 +335,40 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
                 attn = attn.softmax(dim=-1)
                 x_attn = (attn @ v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
 
+                # Use F.embedding for sparse selection and assignment
                 x_attn_flat = x_attn.reshape(-1, x_attn.shape[-1])
-                x_attn_selected = x_attn_flat[dmap_now_flat == 1, :]
-                x_attn_selected = block.attn.proj(x_attn_selected)
-                x_attn = torch.zeros(B_attn * H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=x_attn.dtype)
-                x_attn[dmap_now_flat == 1, :] = x_attn_selected.view(-1, x_attn_selected.shape[-1])
+                if dirty_indices.numel() > 0:
+                    x_attn_selected = F.embedding(dirty_indices, x_attn_flat)
+                    x_attn_selected = block.attn.proj(x_attn_selected)
+                    x_attn = torch.zeros(B_attn * H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=x_attn.dtype)
+                    x_attn.index_copy_(0, dirty_indices, x_attn_selected)
+                else:
+                    x_attn = torch.zeros(B_attn * H_attn * W_attn, x_attn_flat.shape[-1], device=self.device, dtype=x_attn.dtype)
                 x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
 
             else:   # global attention
-                q_selected = q[:, dmap_now_flat == 1, :]
-                num_selected = q_selected.shape[1]
+                # Use F.embedding for sparse selection
+                if dirty_indices.numel() > 0:
+                    q_selected = q[:, dirty_indices, :]
+                    num_selected = q_selected.shape[1]
 
-                attn_selected = (q_selected * block.attn.scale) @ k.transpose(-2, -1)
-                attn = torch.zeros(B_attn * block.attn.num_heads, H_attn * W_attn, H_attn * W_attn, device=self.device, dtype=x_attn.dtype)
-                attn[:, dmap_now_flat == 1, :] = attn_selected
+                    attn_selected = (q_selected * block.attn.scale) @ k.transpose(-2, -1)
+                    attn = torch.zeros(B_attn * block.attn.num_heads, H_attn * W_attn, H_attn * W_attn, device=self.device, dtype=x_attn.dtype)
+                    attn[:, dirty_indices, :] = attn_selected
 
-                if block.attn.use_rel_pos:
-                    attn = add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn), dmap_now)
+                    if block.attn.use_rel_pos:
+                        attn = add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn), dmap_now)
 
-                # projection
-                attn_selected = attn[:, dmap_now_flat == 1, :].softmax(dim=-1)
-                x_attn_selected = (attn_selected @ v).view(B_attn, block.attn.num_heads, num_selected, -1).permute(0, 2, 1, 3).reshape(B_attn, num_selected, -1)
-                x_attn_selected = block.attn.proj(x_attn_selected)
+                    # projection
+                    attn_selected = attn[:, dirty_indices, :].softmax(dim=-1)
+                    x_attn_selected = (attn_selected @ v).view(B_attn, block.attn.num_heads, num_selected, -1).permute(0, 2, 1, 3).reshape(B_attn, num_selected, -1)
+                    x_attn_selected = block.attn.proj(x_attn_selected)
 
-                x_attn = torch.zeros(B_attn, H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=x_attn.dtype)
-                x_attn[:, dmap_now_flat == 1, :] = x_attn_selected
-                x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
+                    x_attn = torch.zeros(B_attn, H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=x_attn.dtype)
+                    x_attn[:, dirty_indices, :] = x_attn_selected
+                    x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
+                else:
+                    x_attn = torch.zeros(B_attn, H_attn, W_attn, self.embed_dim, device=self.device, dtype=x_attn.dtype)
 
             x = x_attn
             
@@ -378,12 +394,12 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
             if block.use_residual_block:    # nothing
                 x = self.residual(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
             
-            fname = f"block{bidx}_out"
-            if fname in anchor_features:
-                # x: (1, 64, 64, 768), anchor_features[fname]: (1, 64, 64, 768)
-                dmap_channeled = dmap_block.expand(-1, -1, -1, x.shape[-1])    # (1, 64, 64, 768)
-                x = x * dmap_channeled + anchor_features[fname] * (1 - dmap_channeled)
-            new_cache_feature[fname] = x.clone()
+        fname = f"block_out"
+        if fname in anchor_features:
+            # x: (1, 64, 64, 768), anchor_features[fname]: (1, 64, 64, 768)
+            dmap_channeled = dmap_block.expand(-1, -1, -1, x.shape[-1])    # (1, 64, 64, 768)
+            x = x * dmap_channeled + anchor_features[fname] * (1 - dmap_channeled)
+        new_cache_feature[fname] = x.clone()
 
         if only_backbone:
             return ([], [], []), new_cache_feature
@@ -458,6 +474,261 @@ class MaskedRCNN_ViT_B_FPN_Contexted(nn.Module):
         # boxes, labels, scores = [], [], []
 
         return (boxes, labels, scores), new_cache_feature
+
+    def forward_contexted_half(
+            self, 
+            image_ndarray: np.ndarray, 
+            anchor_features: Dict[str, torch.Tensor] = {},
+            dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda"),
+            only_backbone: bool = False,
+    ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], Dict[str, torch.Tensor]]:
+        # image_ndarray: (H, W, C)
+        # All operations in half precision
+
+        new_cache_feature = {}
+        
+        # convert to tensor in half precision
+        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device).half()
+        input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
+        
+        # Convert dirtiness_map to half precision
+        dirtiness_map = dirtiness_map.half()
+        
+        # Convert anchor_features to half precision
+        anchor_features_half = {}
+        for key, value in anchor_features.items():
+            anchor_features_half[key] = value.half()
+        
+        # preprocess
+        images = [self.base_model._move_to_current_device(x["image"]) for x in input]
+        images = [(x - self.base_model.pixel_mean.half()) / self.base_model.pixel_std.half() for x in images]
+        images = ImageList.from_tensors(
+            images,
+            self.base_model.backbone.size_divisibility,
+            padding_constraints=self.base_model.backbone.padding_constraints,
+        )
+
+        # inference: backbone
+        backbone = self.base_model.backbone
+        net = backbone.net
+
+        # > ViT
+        x = net.patch_embed(images.tensor)
+        if net.pos_embed is not None:
+            x = x + get_abs_pos(
+                net.pos_embed.half(), net.pretrain_use_cls_token, (x.shape[1], x.shape[2])
+            )
+        
+        # Ensure x is in half precision
+        x = x.half()
+        
+        # x: Tensor(1, 64, 64, 768)
+        # dirtiness_map: Tensor(1, 64, 64, 1)
+
+        dmap_window = None
+        for bidx, block in enumerate(net.blocks):
+            # > EncoderBlock
+            shortcut = x
+            x = block.norm1(x)
+
+            # Window partition
+            dmap_block = dirtiness_map.clone() if bidx not in [] else expand_mask_neighbors(dirtiness_map)
+            dmap_window = None
+            if block.window_size > 0:
+                H, W = x.shape[1], x.shape[2]
+                x, pad_hw = window_partition(x, block.window_size)
+                # pad_hw = (70, 70)
+                # pad the dirtiness map and fill with 0
+                if dmap_window is None:
+                    dmap_window, _ = window_partition(dmap_block, block.window_size)
+
+            # Attention
+            x_attn = x
+            B_attn, H_attn, W_attn, _ = x_attn.shape
+
+            dmap_now = dmap_window if dmap_window is not None else dmap_block
+            dmap_now_flat = dmap_now.reshape(-1)
+
+            # partial QKV generation
+            x_attn_flat = x_attn.reshape(-1, self.embed_dim)
+            
+            # Use F.embedding for sparse selection instead of boolean indexing
+            dirty_indices = torch.nonzero(dmap_now_flat, as_tuple=False).squeeze(1)
+            if dirty_indices.numel() > 0:
+                x_attn_selected = F.embedding(dirty_indices, x_attn_flat)
+                qkv_selected = block.attn.qkv(x_attn_selected)
+                
+                # Use F.embedding for sparse assignment
+                qkv_flat = torch.zeros(B_attn * H_attn * W_attn, 3 * self.embed_dim, device=self.device, dtype=torch.float16)
+                qkv_flat.index_copy_(0, dirty_indices, qkv_selected)
+            else:
+                qkv_flat = torch.zeros(B_attn * H_attn * W_attn, 3 * self.embed_dim, device=self.device, dtype=torch.float16)
+
+            qkv = qkv_flat.reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # qkv with shape (3, B_attn, nHead, H_attn * W_attn, C)
+
+            fname = f"block{bidx}_qkv"
+            if fname in anchor_features_half:
+                dmap_channeled = dmap_now.reshape(B_attn, H_attn * W_attn)
+                dmap_broadcastable = dmap_channeled.unsqueeze(0).unsqueeze(2).unsqueeze(-1)
+                qkv = qkv * dmap_broadcastable + anchor_features_half[fname] * (1 - dmap_broadcastable)
+            new_cache_feature[fname] = qkv.clone()
+
+            q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)  # q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
+
+            # partial attention
+            if bidx not in [2, 5, 8, 11]:   # window attention
+                attn = (q * block.attn.scale) @ k.transpose(-2, -1)
+
+                if block.attn.use_rel_pos:
+                    attn = add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h.half(), block.attn.rel_pos_w.half(), (H_attn, W_attn), (H_attn, W_attn))
+
+                # projection
+                attn = attn.softmax(dim=-1)
+                x_attn = (attn @ v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
+
+                # Use F.embedding for sparse selection and assignment
+                x_attn_flat = x_attn.reshape(-1, x_attn.shape[-1])
+                dirty_indices = torch.nonzero(dmap_now_flat, as_tuple=False).squeeze(1)
+                if dirty_indices.numel() > 0:
+                    x_attn_selected = F.embedding(dirty_indices, x_attn_flat)
+                    x_attn_selected = block.attn.proj(x_attn_selected)
+                    x_attn = torch.zeros(B_attn * H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=torch.float16)
+                    x_attn.index_copy_(0, dirty_indices, x_attn_selected)
+                else:
+                    x_attn = torch.zeros(B_attn * H_attn * W_attn, x_attn_flat.shape[-1], device=self.device, dtype=torch.float16)
+                x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
+
+            else:   # global attention
+                # Use F.embedding for sparse selection
+                dirty_indices = torch.nonzero(dmap_now_flat, as_tuple=False).squeeze(1)
+                if dirty_indices.numel() > 0:
+                    q_selected = q[:, dirty_indices, :]
+                    num_selected = q_selected.shape[1]
+
+                    attn_selected = (q_selected * block.attn.scale) @ k.transpose(-2, -1)
+                    attn = torch.zeros(B_attn * block.attn.num_heads, H_attn * W_attn, H_attn * W_attn, device=self.device, dtype=torch.float16)
+                    attn[:, dirty_indices, :] = attn_selected
+
+                    if block.attn.use_rel_pos:
+                        attn = add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h.half(), block.attn.rel_pos_w.half(), (H_attn, W_attn), (H_attn, W_attn), dmap_now)
+
+                    # projection
+                    attn_selected = attn[:, dirty_indices, :].softmax(dim=-1)
+                    x_attn_selected = (attn_selected @ v).view(B_attn, block.attn.num_heads, num_selected, -1).permute(0, 2, 1, 3).reshape(B_attn, num_selected, -1)
+                    x_attn_selected = block.attn.proj(x_attn_selected)
+
+                    x_attn = torch.zeros(B_attn, H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=torch.float16)
+                    x_attn[:, dirty_indices, :] = x_attn_selected
+                    x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
+                else:
+                    x_attn = torch.zeros(B_attn, H_attn, W_attn, self.embed_dim, device=self.device, dtype=torch.float16)
+
+            x = x_attn
+            
+            # Reverse window partition
+            if block.window_size > 0:
+                x = window_unpartition(x, block.window_size, pad_hw, (H, W))
+
+            # Residual
+            x = shortcut + block.drop_path(x)
+
+            shortcut2 = x
+            x_norm2 = block.norm2(x)
+
+            x_mlp_out = partial_mlp_inference(
+                x_norm2,           # (B, H, W, C)
+                dmap_block,        # (B, H, W, 1)
+                block.mlp, 
+                block.drop_path
+            )
+            x = shortcut2 + x_mlp_out
+
+            if block.use_residual_block:    # nothing
+                x = self.residual(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+            
+            fname = f"block{bidx}_out"
+            if fname in anchor_features_half:
+                # x: (1, 64, 64, 768), anchor_features[fname]: (1, 64, 64, 768)
+                dmap_channeled = dmap_block.expand(-1, -1, -1, x.shape[-1])    # (1, 64, 64, 768)
+                x = x * dmap_channeled + anchor_features_half[fname] * (1 - dmap_channeled)
+            new_cache_feature[fname] = x.clone()
+
+        if only_backbone:
+            return ([], [], []), new_cache_feature
+
+        # > FPN
+        bottom_up_features = {net._out_features[0]: x.permute(0, 3, 1, 2)}
+
+        features = bottom_up_features[backbone.in_feature]  # (1, 768, 64, 64)
+        results = []
+        for stage in backbone.stages:
+            results.append(stage(features))
+
+        if backbone.top_block is not None:
+            if backbone.top_block.in_feature in bottom_up_features:
+                top_block_in_feature = bottom_up_features[backbone.top_block.in_feature]
+            else:
+                top_block_in_feature = results[backbone._out_features.index(backbone.top_block.in_feature)]
+            results.extend(backbone.top_block(top_block_in_feature))
+        assert len(backbone._out_features) == len(results)
+        features = {f: res for f, res in zip(backbone._out_features, results)}
+
+        # inference: RPN
+
+        # > proposal_generator
+        pgen = self.base_model.proposal_generator
+
+        pgen_features = [features[f] for f in pgen.in_features]
+        pgen_anchors = pgen.anchor_generator(pgen_features)
+
+        # pgen_logits, pgen_deltas = pgen.rpn_head(pgen_features) # 15 ms
+        pgen_logits = []
+        pgen_deltas = []
+        for feature in pgen_features:
+            t = pgen.rpn_head.conv(feature)
+
+            logits = pgen.rpn_head.objectness_logits(t)
+            deltas = pgen.rpn_head.anchor_deltas(t)
+
+            pgen_logits.append(logits)
+            pgen_deltas.append(deltas)
+
+        pgen_logits = [logits.permute(0, 2, 3, 1).flatten(1) for logits in pgen_logits]
+        pgen_deltas = [
+            deltas.view(
+                deltas.shape[0],
+                -1,
+                pgen.anchor_generator.box_dim,
+                deltas.shape[-2],
+                deltas.shape[-1]
+            )
+            .permute(0, 3, 4, 1, 2)
+            .flatten(1, -2)
+            for deltas in pgen_deltas
+        ]
+
+        proposals = pgen.predict_proposals(
+            pgen_anchors, pgen_logits, pgen_deltas, images.image_sizes
+        )
+        proposals = [proposals[0].to(self.device)]
+
+        # > roi_heads
+        results, _ = self.base_model.roi_heads(images, features, proposals, None)
+
+        # postprocess
+        detections = self.base_model._postprocess(results, input, images.image_sizes)
+
+        predictions = detections[0]
+        boxes = predictions["instances"].pred_boxes.tensor.cpu().numpy()
+        labels = predictions["instances"].pred_classes.cpu().numpy()
+        scores = predictions["instances"].scores.cpu().numpy()
+
+        # Convert cached features back to original precision if needed
+        new_cache_feature_float = {}
+        for key, value in new_cache_feature.items():
+            new_cache_feature_float[key] = value.float()
+
+        return (boxes, labels, scores), new_cache_feature_float
 
 def reset_head(base_model, num_classes=30, device="cuda"):
     """

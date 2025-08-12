@@ -683,6 +683,39 @@ def get_default_args():
     }
     return defaults
 
+def build_lwdetr_tiny():
+
+    build_args = get_default_args()
+
+    build_args['encoder'] = 'vit_tiny'
+    build_args['vit_encoder_num_layers'] = 6
+    build_args['window_block_indexes'] = [0, 2, 4]
+    build_args['out_feature_indexes'] = [1, 3, 5]
+    build_args['dec_layers'] = 3
+    build_args['group_detr'] = 13
+    build_args['two_stage'] = True
+    build_args['projector_scale'] = ['P4']
+    build_args['hidden_dim'] = 256
+    build_args['sa_nheads'] = 8
+    build_args['ca_nheads'] = 16
+    build_args['dec_n_points'] = 2
+    build_args['bbox_reparam'] = True
+    build_args['lite_refpoint_refine'] = True
+    build_args['num_select'] = 100
+    build_args['num_queries'] = 100
+    build_args['weights'] = './ipconv/models/LW_DETR/LWDETR_tiny_60e_coco.pth'
+    build_args['input'] = None  # Placeholder for input image path
+    build_args['output_dir'] = 'output/lwdetr_tiny'
+    build_args['confidence_threshold'] = 0.5
+
+    from easydict import EasyDict as edict
+    args = edict(build_args)
+
+    model, criterion, postprocessors = build(args)
+    model.load_state_dict(torch.load(args.weights, map_location='cpu')['model'])
+
+    return model, criterion, postprocessors
+
 def build_lwdetr_small():
 
     build_args = get_default_args()

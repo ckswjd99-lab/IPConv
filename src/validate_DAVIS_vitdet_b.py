@@ -16,18 +16,20 @@ from ipconv.models.proc_image import visualize_detection, calculate_multi_iou
 from ipconv.models.constants import COCO_LABELS_LIST
 from ipconv.models.ViTDet.modeling.backbone.utils import expand_mask_neighbors, shrink_mask_neighbors
 
+INPUT_SIZE = 672
+
 def create_sensitivity_map(
     boxes: List[List[float]],  # List of bounding boxes, each box is in a format of [x_min, y_min, x_max, y_max]
     scores: List[float],  # List of scores for each bounding box
 ) -> np.ndarray:
     # Create a blank sensitivity map
-    sensitivity_map = np.zeros((1024, 1024), dtype=np.float32)
+    sensitivity_map = np.zeros((INPUT_SIZE, INPUT_SIZE), dtype=np.float32)
 
     # Iterate through each bounding box and its corresponding score
     for box, score in zip(boxes, scores):
         x_min, y_min, x_max, y_max = map(int, box)
         # Create a mask for the current bounding box
-        mask = np.zeros((1024, 1024), dtype=np.float32)
+        mask = np.zeros((INPUT_SIZE, INPUT_SIZE), dtype=np.float32)
         mask[y_min:y_max, x_min:x_max] = score
         # Add the mask to the sensitivity map
         sensitivity_map += mask
@@ -94,6 +96,7 @@ def create_dirtiness_map(
 
 def get_padded_image(image_ndarray: np.ndarray, size: Tuple[int, int], basic_scaling_factor: float = 1.05) -> np.ndarray:
     image_scaled = cv2.resize(image_ndarray, (int(image_ndarray.shape[1] * basic_scaling_factor), int(image_ndarray.shape[0] * basic_scaling_factor)), interpolation=cv2.INTER_LINEAR)
+    print(image_scaled.shape)
 
     shift_to_center = ((size[1] - image_scaled.shape[1]) // 2, (size[0] - image_scaled.shape[0]) // 2)
 
@@ -105,7 +108,7 @@ def get_padded_image(image_ndarray: np.ndarray, size: Tuple[int, int], basic_sca
 
 @torch.no_grad()
 def estimate_affine_in_padded_anchor(
-    anchor_padded_ndarray: np.ndarray,  # (1024, 1024, 3)
+    anchor_padded_ndarray: np.ndarray,  # (INPUT_SIZE, INPUT_SIZE, 3)
     target_ndarray: np.ndarray,         # (H, W, 3)
 ):
     # Find and match keypoints
@@ -135,16 +138,16 @@ def apply_affine_and_pad(
     target_ndarray: np.ndarray,  # (H, W, 3)
     affine_matrix: np.ndarray,  # (2, 3)
 ) -> np.ndarray | None:
-    result_image = np.zeros((1024, 1024, 3), dtype=np.uint8)
+    result_image = np.zeros((INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
     H, W = target_ndarray.shape[:2]
 
-    transformed_target = cv2.warpAffine(target_ndarray, affine_matrix, (1024, 1024))
+    transformed_target = cv2.warpAffine(target_ndarray, affine_matrix, (INPUT_SIZE, INPUT_SIZE))
     mask = transformed_target != 0
 
-    # Check if any part of the transformed image is outside the 1024x1024 bounds
+    # Check if any part of the transformed image is outside the INPUT_SIZExINPUT_SIZE bounds
     points = np.array([[0, 0], [0, H], [W, 0], [W, H]], dtype=np.float32).reshape(-1, 1, 2)
     transformed_points = cv2.transform(points, affine_matrix)
-    if np.any(transformed_points < 0) or np.any(transformed_points > 1024):
+    if np.any(transformed_points < 0) or np.any(transformed_points > INPUT_SIZE):
         return None
 
     result_image[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
@@ -178,7 +181,7 @@ def affine_ground_truth_boxes(boxes_gt, affine_matrix):
 @torch.no_grad()
 def single_inference(
     model: MaskedRCNN_ViT_B_FPN_Contexted,
-    anchor_padded_ndarray: np.ndarray,  # (1024, 1024, 3)
+    anchor_padded_ndarray: np.ndarray,  # (INPUT_SIZE, INPUT_SIZE, 3)
     target_ndarray: np.ndarray,         # (H, W, 3)
     anchor_features: Dict[str, torch.Tensor],
     basic_scaling_factor: float = 1.05,
@@ -204,14 +207,14 @@ def single_inference(
 
     # do jobs
     if refresh_anchor:
-        target_padded_ndarray = get_padded_image(target_ndarray, (1024, 1024), basic_scaling_factor)
+        target_padded_ndarray = get_padded_image(target_ndarray, (INPUT_SIZE, INPUT_SIZE), basic_scaling_factor)
         comp_end = time.time()
 
         (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(target_padded_ndarray)
         
         # affine matrix: translation with shift_to_center
         target_scaled_ndarray = cv2.resize(target_ndarray, (int(target_ndarray.shape[1] * basic_scaling_factor), int(target_ndarray.shape[0] * basic_scaling_factor)), interpolation=cv2.INTER_LINEAR)
-        shift_to_center = ((1024 - target_scaled_ndarray.shape[1]) // 2, (1024 - target_scaled_ndarray.shape[0]) // 2)
+        shift_to_center = ((INPUT_SIZE - target_scaled_ndarray.shape[1]) // 2, (INPUT_SIZE - target_scaled_ndarray.shape[0]) // 2)
         affine_matrix = np.array([[basic_scaling_factor, 0, shift_to_center[0]], [0, basic_scaling_factor, shift_to_center[1]]], dtype=np.float32)
 
         return (boxes_cont, labels_cont, scores_cont), {
@@ -278,8 +281,8 @@ def single_inference(
 @torch.no_grad()
 def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_dir="./output/contexted_inference_vitdet"):
     # constants
-    fixed_image_size = (1024, 1024)
-    basic_scaling_factor = 1.05
+    fixed_image_size = (INPUT_SIZE, INPUT_SIZE)
+    basic_scaling_factor = 0.5
     recompute_threshold = 0.4
     
     # load sequence
@@ -335,7 +338,7 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
             
             shift_to_center = ((fixed_image_size[1] - current_image.shape[1]) // 2, (fixed_image_size[0] - current_image.shape[0]) // 2)
 
-            current_image_padded = np.zeros((1024, 1024, 3), dtype=np.uint8)
+            current_image_padded = np.zeros((INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
             current_image_padded[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
             current_image_padded[shift_to_center[1]:shift_to_center[1] + current_image.shape[0], shift_to_center[0]:shift_to_center[0] + current_image.shape[1]] = current_image
 
@@ -396,9 +399,9 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
         IoU_gt_mean = np.mean(IoU_gt)
         IoU_gt_results.append(IoU_gt_mean)
         
-        scaling_factor = np.sqrt(np.linalg.det(affine_matrix[:2, :2]))
-        if scaling_factor < 0.98:
-            refresh_anchor = True
+        # scaling_factor = np.sqrt(np.linalg.det(affine_matrix[:2, :2]))
+        # if scaling_factor < 0.98:
+        #     refresh_anchor = True
 
         recompute_rate = np.mean(dirtiness_map.cpu().numpy())
         recompute_rates.append(recompute_rate)
@@ -424,7 +427,7 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
         cv2.imwrite(os.path.join(output_path, "temp", f"{idx:05d}.jpg"), vis_image)
         
         # visualize sensitivity map
-        sensi_image = np.zeros((1024, 1024, 3), dtype=np.uint8)
+        sensi_image = np.zeros((INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
         sensi_image = sensi_image.astype(np.uint16)
         sensi_image[:, :, 0] = np.clip(sensi_image[:, :, 0] + sensi_map * 255, 0, 255)
         sensi_image = sensi_image.astype(np.uint8)
@@ -462,7 +465,7 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
 
 def main():
 
-    data_root = "/data/DAVIS"
+    data_root = "./data/DAVIS"
     output_dir = "./output/contexted_inference_vitdet"
 
     model = MaskedRCNN_ViT_B_FPN_Contexted("cuda")
@@ -471,9 +474,10 @@ def main():
 
     # sequence_names = sorted(os.listdir("/data/DAVIS/JPEGImages/480p"))
     # sequence_names = sequence_names[64:]
-    sequence_names = ["bear", "dog-gooses", "flamingo", "surf", "skate-park"]
+    # sequence_names = ["bear", "dog-gooses", "flamingo", "surf", "skate-park"]
+    sequence_names = ["bear"]
     # gops = [1, 2, 3, 6, 30, 100]
-    gops = [1]
+    gops = [30]
 
     log_text = "Sequence, "
     for gop in gops:

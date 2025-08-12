@@ -15,8 +15,8 @@ def main():
     gops = [1, 6, 30, 100]
 
     for sequence_name in sorted(sequence_names):
-        if os.path.exists(f"./output/contexted_inference/{sequence_name}"):
-            continue
+        # if os.path.exists(f"./output/contexted_inference/{sequence_name}"):
+        #     continue
 
         # save result to file
         os.makedirs(f"./output/contexted_inference/{sequence_name}", exist_ok=True)

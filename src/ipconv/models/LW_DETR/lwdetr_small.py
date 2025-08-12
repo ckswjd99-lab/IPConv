@@ -69,11 +69,7 @@ class LWDETR_Small_Contexted(nn.Module):
         samples = nested_tensor_from_tensor_list([image])
         orig_image_sizes = torch.stack([orig_image_size])
 
-        if self.output is None:
-            outputs = self.model(samples)
-            self.output = outputs
-        else:
-            outputs = self.output
+        outputs = self.model(samples)
 
         predictions = self.postprocessors['bbox'](outputs, orig_image_sizes)
 

@@ -144,7 +144,7 @@ class FasterRCNN_ResNet50_FPN_Contexted(nn.Module):
         return (boxes, labels, scores), new_cache_features
     
     @torch.no_grad()
-    def validate_DAVIS(self, sequence_name, gop, data_root="/data/DAVIS", output_root="./output", leave=False):
+    def validate_DAVIS(self, sequence_name, gop, data_root="./data/DAVIS", output_root="./output", leave=False):
         self.base_model.eval()
 
         sequence_path = os.path.join(data_root, "JPEGImages/480p", sequence_name)
