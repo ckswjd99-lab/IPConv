@@ -222,8 +222,10 @@ def evaluate_sequence(
         ## INFERENCE ##
         if method == "ours" or method == "stgt":
             (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_contexted(image_placed, cached_features_dict, dmap_recompute)
-        elif method == "evit" or method == "maskvd":
+        elif method == "evit":
             (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_eventful(image_placed, cached_features_dict, dmap_recompute)
+        elif method == "maskvd":
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_maskvd(image_placed, cached_features_dict, dmap_recompute)
 
         
         ## POSTPROCESS ##
@@ -434,6 +436,7 @@ if __name__ == "__main__":
                        help="Top-k dirtiness for the dirtiness map. Default is 100.")
     parser.add_argument("--method", type=str, choices=["ours", "evit", "maskvd", "stgt"], default="ours",
                        help="Method to use for evaluation. 'ours' for IPConv, 'evit' for Eventful ViT.")
+    parser.add_argument("--device", type=str, default="cuda:0", help="Device to run the evaluation on.")
     args = parser.parse_args()
 
     main(args)
