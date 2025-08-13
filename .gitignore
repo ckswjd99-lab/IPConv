@@ -175,3 +175,6 @@ data
 *.pkl
 *.pth
 tempdavis/
+*.jpg
+*.png
+temp

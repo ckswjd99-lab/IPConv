@@ -33,7 +33,8 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
 
     # Prepare model
     models_dict = {
-        "vitdet-b": MaskedRCNN_ViT_B_FPN_Contexted,  #이 부분!
+        "vitdet-b-imnetvid": ViTDeT_b_Imagenet_Contexted,
+        "vitdet-b": MaskedRCNN_ViT_B_FPN_Contexted,
         "vitdet-l": MaskedRCNN_ViT_L_FPN_Contexted,
         "vitdet-h": MaskedRCNN_ViT_H_FPN_Contexted,
         "dino-swin4": DINO_4Scale_Swin_Contexted,
@@ -41,12 +42,18 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
     }
 
     models_weight_dict = {
+        "vitdet-b-imnetvid": "./weights/frcnn_vitdet_final.pth",  # 이 부분!
         "vitdet-b": "./weights/model_final_61ccd1.pkl",  # 이 부분!
         "vitdet-l": "./weights/model_final_6146ed.pkl",
         "vitdet-h": "./weights/model_final_7224f1.pkl"
     }
 
     models_settings_dict = {
+        "vitdet-b-imnetvid": {
+            "input_img_size": (1024, 1024),
+            "block_size": 16,
+            "background_color": (123.675, 116.28, 103.53)
+        },
         "vitdet-b": {
             "input_img_size": (1024, 1024),
             "block_size": 16,
@@ -87,7 +94,7 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
             with open(weight_path, 'rb') as f:
                 weights = pickle.load(f)
         else:
-            weights = torch.load(weight_path, map_location='cpu')
+            weights = torch.load(weight_path, map_location='cpu', weights_only=False)
 
         model_state = model.state_dict()
 
@@ -108,7 +115,7 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
         model.load_state_dict(filtered_ckpt, strict=False)
         print(f"✅ Loaded {len(filtered_ckpt)} keys (converted from numpy if needed)")
 
-        model = model.to("cuda")
+        model = model.to(args.device)
 
 
     settings_dict = models_settings_dict[args.model] if args.model in models_settings_dict else {}
@@ -116,8 +123,8 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
     # Prepare dataset
     img_max_size = int(1024 * 0.8) // 2 * 2
 
-    if args.dataset == "davis":
-        data_root = "data/DAVIS/"
+    if args.dataset == "DAVIS2017_trainval":
+        data_root = "data/DAVIS2017_trainval/"
         frames_path = os.path.join(data_root, "JPEGImages/480p")
 
         dataset_dict = {}
@@ -158,6 +165,46 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
                 seq_masks.append(mask_path)
 
             dataset_dict[sequence_name] = list(zip(seq_images, seq_masks))
+    
+    elif args.dataset == "DAVIS2019_challenge" or args.dataset == "DAVIS2019_testdev":
+        data_root = f"data/{args.dataset}/"
+        frames_path = os.path.join(data_root, "JPEGImages/480p")
+
+        dataset_dict = {}
+
+        if args.sequence is None:
+            sequences = [seq for seq in os.listdir(frames_path) if os.path.isdir(os.path.join(frames_path, seq))]
+        else:
+            sequences = args.sequence
+
+        for sequence_name in sequences:
+            sequence_path = os.path.join(frames_path, sequence_name)
+
+            seq_images = []
+            seq_masks = []
+
+            # 이미지와 마스크 파일을 정렬하여 짝맞춤
+            img_names = sorted(os.listdir(sequence_path))
+
+            for img_name in img_names:
+                img_path = os.path.join(sequence_path, img_name)
+
+                img_loaded = cv2.imread(img_path)
+                if img_loaded is None:
+                    print(f"[Warning] Failed to load image: {img_path}")
+                    continue
+
+                img_scaled = cv2.resize(
+                    img_loaded,
+                    dsize=None,
+                    fx=img_max_size / max(img_loaded.shape[:2]),
+                    fy=img_max_size / max(img_loaded.shape[:2]),
+                    interpolation=cv2.INTER_LINEAR
+                )
+                seq_images.append(img_scaled)
+                seq_masks.append(None)
+
+            dataset_dict[sequence_name] = list(zip(seq_images, seq_masks))
 
 
     if args.dataset == "imnet-vid":
@@ -169,7 +216,8 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
             short_edge_length=640, max_size=int(1024 * 0.9)
         ),
         )
-        
+    
+    # dataset_dict["name"] = args.dataset
 
     return model, dataset_dict, settings_dict
 
@@ -352,8 +400,6 @@ def create_dirtiness_map(
         dirtiness_map = cv2.resize(dirtiness_map, (image_W // block_size, image_H // block_size), interpolation=cv2.INTER_LINEAR)
         dirtiness_map = (dirtiness_map > 0).astype(np.float32)
 
-        dirtiness_map = torch.from_numpy(dirtiness_map)
-        dirtiness_map = dirtiness_map.unsqueeze(0).unsqueeze(-1)
     elif dmap_type == "topk":
         dirtiness_map = cv2.resize(dirtiness_map, (image_W // block_size, image_H // block_size), interpolation=cv2.INTER_AREA)
         # make top k elements in dirtiness_map to 1, others to 0
@@ -362,6 +408,9 @@ def create_dirtiness_map(
         topk_values = flat_map[topk_indices]
         threshold = topk_values.min()
         dirtiness_map = (dirtiness_map >= threshold).astype(np.float32)
+    
+    dirtiness_map = torch.from_numpy(dirtiness_map)
+    dirtiness_map = dirtiness_map.unsqueeze(0).unsqueeze(-1)
 
     if dirtiness_map.sum() == 0:
         dirtiness_map[0, 0, 0, 0] = 1

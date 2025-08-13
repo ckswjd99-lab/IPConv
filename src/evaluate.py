@@ -36,12 +36,15 @@ from ipconv.models.ViTDet.modeling.backbone.utils import get_abs_pos
 
 J_list = []
 F_list = []
+recomp_rate_list = []
 
 def evaluate_sequence(
     model: nn.Module,
     sequence_name: str,
     sequence_data: List[Tuple[torch.Tensor, Dict[str, int]]],
     frame_rate: int,
+    method: str,
+    dataset_name: str,
     **kwargs: Any
 ):
     """
@@ -55,8 +58,17 @@ def evaluate_sequence(
             safe_shape = tuple(0 if s == -1 else s for s in shape)
             return torch.empty(*safe_shape, dtype=dtype)
 
+    if method == "maskvd":
+        maskvd_heatmap = np.load("maskvd_heatmap.npy")
+        hmap_H, hmap_W = maskvd_heatmap.shape[:2]
+        heatmap = np.zeros((1024, 1024), dtype=np.float32)
+        # place at center
+        heatmap[(1024 - hmap_H) // 2:(1024 + hmap_H) // 2, (1024 - hmap_W) // 2:(1024 + hmap_W) // 2] = maskvd_heatmap
+        # repeat to 3 channels
+        heatmap = np.repeat(heatmap[:, :, np.newaxis], 3, axis=2)
+
     
-    pbar = tqdm(enumerate(sequence_data))
+    pbar = tqdm(enumerate(sequence_data), leave=False)
     img_sample = sequence_data[0][0]
     img_H, img_W = img_sample.shape[:2]
     input_img_size = (1024, 1024)
@@ -116,7 +128,6 @@ def evaluate_sequence(
         # > scale check
         if not refresh:
             scaling_factor = np.sqrt(np.linalg.det(placing_matrix[:2, :2]))
-            print(f"Scaling factor: {scaling_factor:.2f}")
             if scaling_factor < 0.8 or scaling_factor > 1.2:
                 refresh = True
 
@@ -127,6 +138,9 @@ def evaluate_sequence(
             frames_until_refresh = frame_rate
             cached_features_dict = {}
             shift_x, shift_y = 0, 0
+        
+        if method != "ours":
+            placing_matrix = centering_matrix.copy()
 
         # > Place the image in the input
         image_placed = np.zeros((input_img_size[1], input_img_size[0], 3), dtype=np.uint8)
@@ -152,14 +166,24 @@ def evaluate_sequence(
         
         # > Create dirtiness map and sensitivity map
         if not refresh:
-            dmap_raw = create_dirtiness_map(
-                anchor_image=ref_frame_aligned,
-                current_image=image_placed,
-                block_size=block_size,
-                dmap_type=args.dmap_type,
-                dirty_thres=args.dirty_thres,
-                dirty_topk=args.dirty_topk
-            )
+            if method == "maskvd":
+                dmap_raw = create_dirtiness_map(
+                    anchor_image=heatmap,
+                    current_image=np.zeros_like(heatmap, dtype=np.float32),
+                    block_size=block_size,
+                    dmap_type=args.dmap_type,
+                    dirty_thres=args.dirty_thres,
+                    dirty_topk=args.dirty_topk
+                )
+            else:
+                dmap_raw = create_dirtiness_map(
+                    anchor_image=ref_frame_aligned,
+                    current_image=image_placed,
+                    block_size=block_size,
+                    dmap_type=args.dmap_type,
+                    dirty_thres=args.dirty_thres,
+                    dirty_topk=args.dirty_topk
+                )
 
             if isinstance(dmap_raw, np.ndarray):
                 dmap = torch.from_numpy(dmap_raw).to("cuda")
@@ -180,23 +204,32 @@ def evaluate_sequence(
             image_placed = np.clip(image_placed, 0, 255).astype(np.uint8)
 
         # > Expand the sensitive area
-        if sensitivity_map is not None:
+        if sensitivity_map is not None and method == "ours":
             dmap_expanded = expand_mask_neighbors(dmap).cpu().numpy().squeeze(0).squeeze(-1)
             sensi_map_downsized = cv2.resize(sensitivity_map, (input_img_size[0] // block_size, input_img_size[1] // block_size), interpolation=cv2.INTER_AREA)
             sensi_map_downsized = (sensi_map_downsized > 0.5).astype(np.float32)
             dmap_expanded = dmap_expanded * sensi_map_downsized + dmap.squeeze().cpu().numpy() * (1 - sensi_map_downsized)
+            dmap_recompute = torch.from_numpy(dmap_expanded).unsqueeze(0).unsqueeze(-1).to("cuda")
+        elif sensitivity_map is not None and method == "maskvd":
+            sensi_map_downsized = cv2.resize(sensitivity_map, (input_img_size[0] // block_size, input_img_size[1] // block_size), interpolation=cv2.INTER_AREA)
+            sensi_map_downsized = (sensi_map_downsized > 0.5).astype(np.float32)
+            dmap_expanded = sensi_map_downsized + dmap.squeeze().cpu().numpy() * (1 - sensi_map_downsized)
             dmap_recompute = torch.from_numpy(dmap_expanded).unsqueeze(0).unsqueeze(-1).to("cuda")
         else:
             dmap_recompute = dmap
 
 
         ## INFERENCE ##
-        (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_contexted(image_placed, cached_features_dict, dmap_recompute)
+        if method == "ours" or method == "stgt":
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_contexted(image_placed, cached_features_dict, dmap_recompute)
+        elif method == "evit" or method == "maskvd":
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_eventful(image_placed, cached_features_dict, dmap_recompute)
 
         
         ## POSTPROCESS ##
         # > Create sensitivity map
-        sensitivity_map = create_sensitivity_map(boxes_cont, scores_cont, input_img_size)
+        if method in ["ours", "maskvd"]:
+            sensitivity_map = create_sensitivity_map(boxes_cont, scores_cont, input_img_size)
         
         '''
         ## VISUALIZE ##
@@ -262,7 +295,7 @@ def evaluate_sequence(
             imageio.imwrite(save_path, composite_mask)
         
         frame_name = f"{idx:05d}"
-        output_mask_path = f"./pred_masks_davis/{sequence_name}/{frame_name}.png"
+        output_mask_path = f"./pred_masks_{dataset_name}/{method}_{frame_rate:d}/{sequence_name}/{frame_name}.png"
 
 
         original_shape = (img_H, img_W)  # image.shape[:2] before placing
@@ -274,24 +307,27 @@ def evaluate_sequence(
             save_path=output_mask_path
         )
 
-        gt = cv2.imread(annotations, 0)
-        pred = cv2.imread(output_mask_path, 0)
+        if annotations:
+            gt = cv2.imread(annotations, 0)
+            pred = cv2.imread(output_mask_path, 0)
 
-        img_max_size = int(1024 * 0.8) // 2 * 2
-        scale_factor = img_max_size / max(gt.shape[:2])
-        gt = cv2.resize(
-            gt,
-            dsize=None,
-            fx=scale_factor,
-            fy=scale_factor,
-            interpolation=cv2.INTER_NEAREST
-        )
+            img_max_size = int(1024 * 0.8) // 2 * 2
+            scale_factor = img_max_size / max(gt.shape[:2])
+            gt = cv2.resize(
+                gt,
+                dsize=None,
+                fx=scale_factor,
+                fy=scale_factor,
+                interpolation=cv2.INTER_NEAREST
+            )
 
-        j = db_eval_iou(gt, pred)
-        f = db_eval_boundary(gt, pred)
+            j = db_eval_iou(gt, pred)
+            f = db_eval_boundary(gt, pred)
 
-        J_list.append(j)
-        F_list.append(f)
+            J_list.append(j)
+            F_list.append(f)
+        
+        recomp_rate_list.append(dmap_recompute.mean().item())
 
     #os.system(f"ffmpeg -framerate {frame_rate} -i temp/{sequence_name}_%04d.jpg -c:v libx264 -pix_fmt yuv420p temp/{sequence_name}_{frame_rate}fps.mp4 -y")
 
@@ -300,6 +336,7 @@ def evaluate(
     model, 
     dataset: Dict[str, List[Tuple[torch.Tensor, Dict[str, int]]]],
     frame_rates: List[int],
+    method: str,
     **kwargs: Any
 ):
     """
@@ -311,9 +348,12 @@ def evaluate(
     n_frames = 0
 
     for sequence_name, sequence_data in dataset.items():
+        if sequence_name == "name": continue
+
+        dataset_name = dataset.get("name", "imnetvid")
         for frame_rate in frame_rates:
             print(f"Evaluating sequence: {sequence_name}, frame rate: {frame_rate} fps")
-            evaluate_sequence(model, sequence_name, sequence_data, frame_rate, **kwargs)
+            evaluate_sequence(model, sequence_name, sequence_data, frame_rate, method, dataset_name=dataset_name, **kwargs)
             model.reset()
             n_frames += len(sequence_data)
     
@@ -332,27 +372,38 @@ def main(args):
 
     model, dataset, settings_dict = prepare_environment(args)
 
-    counts = evaluate(model, dataset, args.frame_rates, **settings_dict)
+    counts = evaluate(model, dataset, args.frame_rates, args.method, **settings_dict)
 
     model_name = f"{args.model}"
     frame_rate_str = f"{args.frame_rates[0]}fps"
     dirtiness_key = f"thres{args.dirty_thres}" if args.dmap_type == "threshold" else f"topk{args.dirty_topk}"
-    output_dir = Path("output/davis") / model_name / frame_rate_str / dirtiness_key
+    output_dir = Path("output") / args.dataset / model_name / f"{args.method}_{frame_rate_str}" / dirtiness_key
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 2. 평균 계산
     mean_J = np.mean(J_list)
     mean_F = np.mean(F_list)
+    mean_recomp_rate = np.mean(recomp_rate_list)
 
     # 3. 파일로 저장
     with open(output_dir / "mean_JF.txt", "w") as tee_file:
+        tee_file.write(f"Model: {model_name}\n")
+        tee_file.write(f"Frame Rate: {args.frame_rates[0]} fps\n")
+        tee_file.write(f"Dirtiness Map Type: {args.dmap_type}\n")
+        tee_file.write(f"Dirtiness Threshold: {args.dirty_thres}\n")
+        tee_file.write(f"Dirtiness Top-K: {args.dirty_topk}\n")
+        tee_file.write(f"Method: {args.method}\n")
+        tee_file.write(f"\n")
         tee_file.write(f"Mean J: {mean_J:.4f}\n")
         tee_file.write(f"Mean F: {mean_F:.4f}\n")
+        tee_file.write(f"\n")
+        tee_file.write(f"Mean Recomp Rate: {mean_recomp_rate:.4f}\n")
         for key, val in counts.items():
             tee_print(key.capitalize(), tee_file)
             tee_print(dict_string(val), tee_file)
 
     print(f"[Saved] Mean J and F written to {output_dir / 'mean_JF.txt'}")
+    print(f"mean J: {mean_J:.4f}, mean F: {mean_F:.4f}, mean recomp rate: {mean_recomp_rate:.4f}")
 
 
 def parse_int_list(value):
@@ -365,11 +416,11 @@ def parse_str_list(value):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate a model on a dataset.")
-    parser.add_argument("--model", type=str, default="vitdet-h", help="Model to use for evaluation.",
+    parser.add_argument("--model", type=str, default="vitdet-b", help="Model to use for evaluation.",
         choices=["vitdet-b", "vitdet-l", "vitdet-h", "dino-swin4", "lwdetr"],
     )
-    parser.add_argument("--dataset", type=str, default="davis", help="Dataset to evaluate on.",
-        choices=["davis", "imnet-vid"],
+    parser.add_argument("--dataset", type=str, default="davis2017_trainval", help="Dataset to evaluate on.",
+        choices=["DAVIS2017_trainval", "DAVIS2019_challenge", "DAVIS2019_testdev"],
     )
     parser.add_argument("--frame-rates", type=parse_int_list, default=[100], 
                        help="Frame rate(s) for evaluation. Comma-separated integers (e.g., 1,6,100).")
@@ -379,8 +430,10 @@ if __name__ == "__main__":
                        help="Type of dirtiness map to use. 'threshold' for thresholding, 'topk' for top-k dirtiness.")
     parser.add_argument("--dirty_thres", type=int, default=30, nargs="?",
                        help="Dirtiness threshold for the dirtiness map. Default is 30.")
-    parser.add_argument("--dirty-topk", type=int, default=100, nargs="?",
+    parser.add_argument("--dirty_topk", type=int, default=100, nargs="?",
                        help="Top-k dirtiness for the dirtiness map. Default is 100.")
+    parser.add_argument("--method", type=str, choices=["ours", "evit", "maskvd", "stgt"], default="ours",
+                       help="Method to use for evaluation. 'ours' for IPConv, 'evit' for Eventful ViT.")
     args = parser.parse_args()
 
     main(args)

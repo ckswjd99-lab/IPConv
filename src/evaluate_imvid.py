@@ -30,12 +30,14 @@ from ipconv.models.ViTDet.modeling.backbone.utils import get_abs_pos
 
 outputs = []
 labels = []
+recompute_rate = []
 
 def evaluate_sequence(
     model: nn.Module,
     sequence_name: str,
     sequence_data: List[Tuple[torch.Tensor, Dict[str, int]]],
     frame_rate: int,
+    method: str,
     dmap_type: str = "threshold",
     dirty_thres: int = 30,
     dirty_topk: int = 100,
@@ -54,8 +56,17 @@ def evaluate_sequence(
             safe_shape = tuple(0 if s == -1 else s for s in shape)
             return torch.empty(*safe_shape, dtype=dtype)
 
+    if method == "maskvd":
+        maskvd_heatmap = np.load("maskvd_heatmap.npy")
+        hmap_H, hmap_W = maskvd_heatmap.shape[:2]
+        heatmap = np.zeros((1024, 1024), dtype=np.float32)
+        # place at center
+        heatmap[(1024 - hmap_H) // 2:(1024 + hmap_H) // 2, (1024 - hmap_W) // 2:(1024 + hmap_W) // 2] = maskvd_heatmap
+        # repeat to 3 channels
+        heatmap = np.repeat(heatmap[:, :, np.newaxis], 3, axis=2)
+
     
-    pbar = enumerate(sequence_data)
+    pbar = tqdm(enumerate(sequence_data), leave=False, total=len(sequence_data), desc=f"Evaluating {sequence_name} at {frame_rate} fps")
     img_sample = sequence_data[0][0]
     img_H, img_W = img_sample.shape[1:]
     input_img_size = (1024, 1024)
@@ -128,6 +139,9 @@ def evaluate_sequence(
             frames_until_refresh = frame_rate
             cached_features_dict = {}
             shift_x, shift_y = 0, 0
+        
+        if method != "ours":
+            placing_matrix = centering_matrix.copy()
 
         # > Place the image in the input
         image_placed = np.zeros((input_img_size[1], input_img_size[0], 3), dtype=np.uint8)
@@ -153,23 +167,33 @@ def evaluate_sequence(
         
         # > Create dirtiness map and sensitivity map
         if not refresh:
-            dmap_raw = create_dirtiness_map(
-                anchor_image=ref_frame_aligned,
-                current_image=image_placed,
-                block_size=block_size,
-                dmap_type=dmap_type,
-                dirty_thres=dirty_thres,
-                dirty_topk=dirty_topk
-            )
+            if method == "maskvd":
+                dmap_raw = create_dirtiness_map(
+                    anchor_image=heatmap,
+                    current_image=np.zeros_like(heatmap, dtype=np.float32),
+                    block_size=block_size,
+                    dmap_type=dmap_type,
+                    dirty_thres=dirty_thres,
+                    dirty_topk=dirty_topk
+                )
+            else:
+                dmap_raw = create_dirtiness_map(
+                    anchor_image=ref_frame_aligned,
+                    current_image=image_placed,
+                    block_size=block_size,
+                    dmap_type=dmap_type,
+                    dirty_thres=dirty_thres,
+                    dirty_topk=dirty_topk
+                )
 
             if isinstance(dmap_raw, np.ndarray):
-                dmap = torch.from_numpy(dmap_raw).to("cuda")
+                dmap = torch.from_numpy(dmap_raw).to("cuda:1")
             elif isinstance(dmap_raw, torch.Tensor):
-                dmap = dmap_raw.to("cuda")
+                dmap = dmap_raw.to("cuda:1")
             else:
                 raise TypeError("Unsupported type for dirtiness map")
         else:
-            dmap = torch.ones(1, 64, 64, 1, device="cuda")
+            dmap = torch.ones(1, 64, 64, 1, device="cuda:1")
 
         
         dmap_ndarray = dmap.squeeze().cpu().numpy()
@@ -182,23 +206,34 @@ def evaluate_sequence(
             image_placed = np.clip(image_placed, 0, 255).astype(np.uint8)
 
         # > Expand the sensitive area
-        if sensitivity_map is not None:
+        if sensitivity_map is not None and method == "ours":
             dmap_expanded = expand_mask_neighbors(dmap, sensi_expansion).cpu().numpy().squeeze(0).squeeze(-1)
             sensi_map_downsized = cv2.resize(sensitivity_map, (input_img_size[0] // block_size, input_img_size[1] // block_size), interpolation=cv2.INTER_AREA)
             sensi_map_downsized = (sensi_map_downsized > 0.5).astype(np.float32)
             dmap_expanded = dmap_expanded * sensi_map_downsized + dmap.squeeze().cpu().numpy() * (1 - sensi_map_downsized)
-            dmap_recompute = torch.from_numpy(dmap_expanded).unsqueeze(0).unsqueeze(-1).to("cuda")
+            dmap_recompute = torch.from_numpy(dmap_expanded).unsqueeze(0).unsqueeze(-1).to("cuda:1")
+        elif sensitivity_map is not None and method == "maskvd":
+            sensi_map_downsized = cv2.resize(sensitivity_map, (input_img_size[0] // block_size, input_img_size[1] // block_size), interpolation=cv2.INTER_AREA)
+            sensi_map_downsized = (sensi_map_downsized > 0.5).astype(np.float32)
+            dmap_expanded = sensi_map_downsized + dmap.squeeze().cpu().numpy() * (1 - sensi_map_downsized)
+            dmap_recompute = torch.from_numpy(dmap_expanded).unsqueeze(0).unsqueeze(-1).to("cuda:1")
         else:
             dmap_recompute = dmap
 
 
         ## INFERENCE ##
-        (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(image_placed, cached_features_dict, dmap_recompute)
+        if method == "ours" or method == "stgt":
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(image_placed, cached_features_dict, dmap_recompute)
+        elif method == "evit" or method == "maskvd":
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_eventful(image_placed, cached_features_dict, dmap_recompute)
+
+        recompute_rate.append(dmap_recompute.mean().item())
 
         
         ## POSTPROCESS ##
         # > Create sensitivity map
-        sensitivity_map = create_sensitivity_map(boxes_cont, scores_cont, input_img_size)
+        if method in ["ours", "maskvd"]:
+            sensitivity_map = create_sensitivity_map(boxes_cont, scores_cont, input_img_size)
         
         '''
         ## VISUALIZE ##
@@ -280,6 +315,7 @@ def evaluate(
     model, 
     dataset: Dict[str, List[Tuple[torch.Tensor, Dict[str, int]]]],
     frame_rates: List[int],
+    method: str,
     dmap_type: str = "threshold",
     dirty_thres: int = 30,
     dirty_topk: int = 100,
@@ -296,16 +332,16 @@ def evaluate(
     n_frames = 0
     for sequence_data in dataset:
         for frame_rate in frame_rates:
-            try:
-                print(f"Evaluating sequence: {sequence_name}, frame rate: {frame_rate} fps")
+            # try:
+            print(f"Evaluating sequence: {sequence_name}, frame rate: {frame_rate} fps")
 
-                evaluate_sequence(model, sequence_name, sequence_data, frame_rate, dmap_type, dirty_thres, dirty_topk, sensi_expansion, **kwargs)
-                model.reset()
-                n_frames += len(sequence_data)
+            evaluate_sequence(model, sequence_name, sequence_data, frame_rate, method, dmap_type, dirty_thres, dirty_topk, sensi_expansion, **kwargs)
+            model.reset()
+            n_frames += len(sequence_data)
 
-            except Exception as e:
-                print(f"[Error] sequence {sequence_name}, frame rate {frame_rate} fps: {e}")
-                break
+            # except Exception as e:
+            #     print(f"[Error] sequence {sequence_name}, frame rate {frame_rate} fps: {e}")
+            #     break
 
         sequence_name += 1
 
@@ -342,6 +378,7 @@ def main(args):
             else:
                 tee_print(results, tee_file)
             tee_print("", tee_file)
+            tee_print(f"Recompute rate: {np.mean(recompute_rate):.4f}", tee_file)
             completed.append(title)
 
             save_path = output_dir / "pred_outputs.pt"
@@ -357,7 +394,7 @@ def main(args):
 
     model, dataset, settings_dict = prepare_environment(args)
 
-    results = evaluate(model, dataset, args.frame_rates, args.dmap_type, args.dirty_thres, args.dirty_topk, args.sensi_expansion, **settings_dict)
+    results = evaluate(model, dataset, args.frame_rates, args.method, args.dmap_type, args.dirty_thres, args.dirty_topk, args.sensi_expansion, **settings_dict)
 
     completed = []
     frame_rate_str = f"{args.frame_rates[0]}fps"
@@ -379,8 +416,8 @@ def parse_str_list(value):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate a model on a dataset.")
-    parser.add_argument("--model", type=str, default="vitdet-b", help="Model to use for evaluation.",
-        choices=["vitdet-b", "vitdet-l", "vitdet-h", "dino-swin4", "lwdetr"],
+    parser.add_argument("--model", type=str, default="vitdet-b-imnetvid", help="Model to use for evaluation.",
+        choices=["vitdet-b-imnetvid"],
     )
     parser.add_argument("--dataset", type=str, default="imnet-vid", help="Dataset to evaluate on.",
         choices=["davis", "imnet-vid"],
@@ -397,6 +434,9 @@ if __name__ == "__main__":
                        help="Top-k dirtiness for the dirtiness map. Default is 100.")
     parser.add_argument("--sensi-expansion", type=int, default=1,
                        help="Expansion factor for the sensitivity map. Default is 1.")
+    parser.add_argument("--method", type=str, choices=["ours", "evit", "maskvd", "stgt"], default="ours",
+                       help="Method to use for evaluation. 'ours' for IPConv, 'evit' for Eventful ViT.")
+    parser.add_argument("--device", type=str, default="cuda:1",)
     args = parser.parse_args()
 
     main(args)
