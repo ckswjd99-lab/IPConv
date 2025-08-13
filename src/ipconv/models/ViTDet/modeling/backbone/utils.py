@@ -334,7 +334,7 @@ def partial_mlp_inference(x, dmap, mlp_module, drop_path_fn=None):
     if dirty_indices.numel() == 0:
         return x
 
-    dirty_tokens = x_flat[dirty_indices, :]  # shape: (D, C)
+    dirty_tokens = F.embedding(dirty_indices, x_flat)  # shape: (D, C)
 
     updated_tokens = mlp_module(dirty_tokens)
 
