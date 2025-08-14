@@ -121,7 +121,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         images = ImageList.from_tensors(
             images,
             self.base_model.backbone.size_divisibility,
-            padding_constraints=self.base_model.backbone.padding_constraints,
+            padding_constraints={"size_divisibility": self.base_model.backbone.size_divisibility, "padding_constraints": image_ndarray.shape[0]},
         )
 
         # inference: backbone
@@ -196,8 +196,8 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
                     ape_block = ape
                 ape_block = block.attn.qkv(ape_block).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # ape_block with shape (3, B_attn, nHead, H_attn * W_attn, C)
                 
-                # new_cache_feature[fname] = ape_block.clone()[1:]  # for strict cache size management
-                new_cache_feature[fname] = ape_block.clone() # for easy inference
+                new_cache_feature[fname] = ape_block.clone()[1:]  # for strict cache size management
+                # new_cache_feature[fname] = ape_block.clone() # for easy inference
 
             fname = f"block{bidx}_std"
             x_std, _ = window_partition(x_std, block.window_size) if block.window_size > 0 else (x_std, None)
@@ -332,7 +332,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         images = ImageList.from_tensors(
             images,
             self.base_model.backbone.size_divisibility,
-            padding_constraints=self.base_model.backbone.padding_constraints,
+            padding_constraints={"size_divisibility": self.base_model.backbone.size_divisibility, "padding_constraints": image_ndarray.shape[0]},
         )
 
         # inference: backbone
@@ -556,7 +556,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         images = ImageList.from_tensors(
             images,
             self.base_model.backbone.size_divisibility,
-            padding_constraints=self.base_model.backbone.padding_constraints,
+            padding_constraints={"size_divisibility": self.base_model.backbone.size_divisibility, "padding_constraints": image_ndarray.shape[0]},
         )
 
         # inference: backbone

@@ -16,19 +16,23 @@ from ipconv.models import (
 def measure_latency_memory(
     model: nn.Module,
     patch_keep_rate: float,
-    method: str
+    method: str,
+    input_size: int
 ):
     model.eval()
-    dummy_input = np.zeros((1024, 1024, 3))
+    dummy_input = np.zeros((input_size, input_size, 3))
+    block_size = 16
+    num_blocks_sqrt = input_size // block_size
 
-    dmap = torch.zeros((1, 64, 64, 1), dtype=torch.float32, device="cuda")
-    num_patches = 64 * 64
+
+    dmap = torch.zeros((1, num_blocks_sqrt, num_blocks_sqrt, 1), dtype=torch.float32, device="cuda")
+    num_patches = num_blocks_sqrt * num_blocks_sqrt
     num_keep = int(num_patches * patch_keep_rate)
     idx_rand = torch.randperm(num_patches)[:num_keep]
     dmap.view(-1)[idx_rand] = 1.0
 
-    num_warmup = 5
-    num_repeats = 10
+    num_warmup = 3
+    num_repeats = 5
 
     # inference_func = model.forward_contexted if method == "ours" else model.forward_eventful
     if method == "vanilla":
@@ -68,7 +72,7 @@ def measure_latency_memory(
 @torch.no_grad()
 def main():
     models_dict = {
-        "ViT-base": MaskedRCNN_ViT_B_FPN_Contexted,
+        # "ViT-base": MaskedRCNN_ViT_B_FPN_Contexted,
         "ViT-large": MaskedRCNN_ViT_L_FPN_Contexted,
         "ViT-huge": MaskedRCNN_ViT_H_FPN_Contexted,
     }
@@ -78,16 +82,19 @@ def main():
 
     methods = ["ours", "eventful", "maskvd"]
     # methods = ["vanilla"]
-    # methods = ["ours"]
+    # methods = ["eventful"]
+
+    input_sizes = [672]
 
     for mname, model_class in models_dict.items():
         model = model_class("cuda")
         model.eval()
 
-        for method in methods:
-            for keep_rate in keep_rates:
-                latency, cache_size = measure_latency_memory(model, keep_rate, method)
-                print(f"Model: {mname}, Method: {method}, Patch Keep Rate: {keep_rate}, Latency: {latency:.4f} seconds, Cache Size: {cache_size / (1024 * 1024):.2f} MB")
+        for input_size in input_sizes:
+            for method in methods:
+                for keep_rate in keep_rates:
+                    latency, cache_size = measure_latency_memory(model, keep_rate, method, input_size)
+                    print(f"Model: {mname}, Input: {input_size}, Method: {method}, Patch Keep Rate: {keep_rate}, Latency: {latency:.4f} seconds, Cache Size: {cache_size / (1024 * 1024):.2f} MB")
 
 if __name__ == "__main__":
     main()
