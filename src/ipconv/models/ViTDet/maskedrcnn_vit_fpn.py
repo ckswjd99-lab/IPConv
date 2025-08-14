@@ -83,7 +83,14 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
         
         # detections = self.base_model(input)
-        images = self.base_model.preprocess_image(input)
+        images = [self.base_model._move_to_current_device(x["image"]) for x in input]
+        images = [(x - self.base_model.pixel_mean) / self.base_model.pixel_std for x in images]
+        images = ImageList.from_tensors(
+            images,
+            self.base_model.backbone.size_divisibility,
+            padding_constraints={"size_divisibility": self.base_model.backbone.size_divisibility, "padding_constraints": image_ndarray.shape[0]},
+        )
+        
         features = self.base_model.backbone(images.tensor)
         
         if only_backbone:
@@ -194,7 +201,8 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
                     ape_block, _ = window_partition(ape, block.window_size)
                 else:
                     ape_block = ape
-                ape_block = block.attn.qkv(ape_block).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # ape_block with shape (3, B_attn, nHead, H_attn * W_attn, C)
+                # disable for latency measurement: can be done offline
+                # ape_block = block.attn.qkv(ape_block).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # ape_block with shape (3, B_attn, nHead, H_attn * W_attn, C)
                 
                 new_cache_feature[fname] = ape_block.clone()[1:]  # for strict cache size management
                 # new_cache_feature[fname] = ape_block.clone() # for easy inference
