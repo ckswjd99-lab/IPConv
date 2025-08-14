@@ -31,8 +31,8 @@ def measure_latency_memory(
     idx_rand = torch.randperm(num_patches)[:num_keep]
     dmap.view(-1)[idx_rand] = 1.0
 
-    num_warmup = 3
-    num_repeats = 5
+    num_warmup = 5
+    num_repeats = 10
 
     # inference_func = model.forward_contexted if method == "ours" else model.forward_eventful
     if method == "vanilla":
@@ -43,6 +43,8 @@ def measure_latency_memory(
         inference_func = model.forward_eventful
     elif method == "maskvd":
         inference_func = model.forward_maskvd
+    elif method == "stgt":
+        inference_func = model.forward_stgt
     else:
         raise ValueError(f"Unknown method: {method}")
 
@@ -72,7 +74,7 @@ def measure_latency_memory(
 @torch.no_grad()
 def main():
     models_dict = {
-        # "ViT-base": MaskedRCNN_ViT_B_FPN_Contexted,
+        "ViT-base": MaskedRCNN_ViT_B_FPN_Contexted,
         "ViT-large": MaskedRCNN_ViT_L_FPN_Contexted,
         "ViT-huge": MaskedRCNN_ViT_H_FPN_Contexted,
     }
@@ -80,11 +82,11 @@ def main():
     keep_rates = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     # keep_rates = [0.1]
 
-    methods = ["ours", "eventful", "maskvd"]
+    # methods = ["ours", "eventful", "maskvd", "stgt"]
     # methods = ["vanilla"]
-    # methods = ["eventful"]
+    methods = ["stgt"]
 
-    input_sizes = [672]
+    input_sizes = [1024, 672]
 
     for mname, model_class in models_dict.items():
         model = model_class("cuda")
