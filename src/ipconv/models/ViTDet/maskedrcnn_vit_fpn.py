@@ -82,6 +82,10 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         
         detections = self.base_model(input)
 
+        only_backbone = kwargs.get("only_backbone", False)
+        if only_backbone:
+            return ([], [], []), {}
+
         predictions = detections[0]
         boxes = predictions["instances"].pred_boxes.tensor.cpu().numpy()
         labels = predictions["instances"].pred_classes.cpu().numpy()
