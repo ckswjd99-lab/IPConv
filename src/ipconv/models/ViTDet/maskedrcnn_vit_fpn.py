@@ -169,8 +169,11 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             if fname in anchor_features:
                 dmap_channeled = dmap_now.reshape(B_attn, H_attn * W_attn)
                 dmap_broadcastable = dmap_channeled.unsqueeze(0).unsqueeze(2).unsqueeze(-1)
-                qkv = self.add(qkv * dmap_broadcastable, anchor_features[fname] * (1 - dmap_broadcastable))
-            new_cache_feature[fname] = qkv.clone()
+                kv_cached = anchor_features[fname]
+                qkv_cached = torch.zeros_like(qkv)
+                qkv_cached[1:] = self.add(qkv[1:] * dmap_broadcastable, kv_cached * (1 - dmap_broadcastable))
+                qkv = qkv_cached
+            new_cache_feature[fname] = qkv.clone()[1:]
 
             fname = f"block{bidx}_qkvpe"
             if fname in anchor_features:
@@ -182,7 +185,8 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
                     ape_block = ape
                 ape_block = block.attn.qkv(ape_block).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # ape_block with shape (3, B_attn, nHead, H_attn * W_attn, C)
                 
-                new_cache_feature[fname] = ape_block.clone()
+                # new_cache_feature[fname] = ape_block.clone()[1:]  # for strict cache size management
+                new_cache_feature[fname] = ape_block.clone() # for easy inference
 
             fname = f"block{bidx}_std"
             x_std, _ = window_partition(x_std, block.window_size) if block.window_size > 0 else (x_std, None)
@@ -252,12 +256,12 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             if block.use_residual_block:    # nothing
                 x = self.residual(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
             
-            fname = f"block{bidx}_out"
-            if fname in anchor_features:
-                # x: (1, 64, 64, 768), anchor_features[fname]: (1, 64, 64, 768)
-                dmap_channeled = dmap_block.expand(-1, -1, -1, x.shape[-1])    # (1, 64, 64, 768)
-                x = self.add(x * dmap_channeled, anchor_features[fname] * (1 - dmap_channeled))
-            new_cache_feature[fname] = x.clone()
+        fname = f"block_out"
+        if fname in anchor_features:
+            # x: (1, 64, 64, 768), anchor_features[fname]: (1, 64, 64, 768)
+            dmap_channeled = dmap_block.expand(-1, -1, -1, x.shape[-1])    # (1, 64, 64, 768)
+            x = self.add(x * dmap_channeled, anchor_features[fname] * (1 - dmap_channeled))
+        new_cache_feature[fname] = x.clone()
 
         if only_backbone:
             return ([], [], []), new_cache_feature
@@ -475,12 +479,12 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             if block.use_residual_block:    # nothing
                 x = self.residual(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
             
-            fname = f"block{bidx}_out"
-            if fname in anchor_features:
-                # x: (1, 64, 64, 768), anchor_features[fname]: (1, 64, 64, 768)
-                dmap_channeled = dmap_block.expand(-1, -1, -1, x.shape[-1])    # (1, 64, 64, 768)
-                x = self.add(x * dmap_channeled, anchor_features[fname] * (1 - dmap_channeled))
-            new_cache_feature[fname] = x.clone()
+        fname = f"block_out"
+        if fname in anchor_features:
+            # x: (1, 64, 64, 768), anchor_features[fname]: (1, 64, 64, 768)
+            dmap_channeled = dmap_block.expand(-1, -1, -1, x.shape[-1])    # (1, 64, 64, 768)
+            x = self.add(x * dmap_channeled, anchor_features[fname] * (1 - dmap_channeled))
+        new_cache_feature[fname] = x.clone()
 
         if only_backbone:
             return ([], [], []), new_cache_feature

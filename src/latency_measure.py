@@ -69,15 +69,16 @@ def measure_latency_memory(
 def main():
     models_dict = {
         "ViT-base": MaskedRCNN_ViT_B_FPN_Contexted,
-        # "ViT-large": MaskedRCNN_ViT_L_FPN_Contexted,
-        # "ViT-huge": MaskedRCNN_ViT_H_FPN_Contexted,
+        "ViT-large": MaskedRCNN_ViT_L_FPN_Contexted,
+        "ViT-huge": MaskedRCNN_ViT_H_FPN_Contexted,
     }
 
     keep_rates = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     # keep_rates = [0.1]
 
-    # methods = ["ours", "eventful", "maskvd", "vanilla"]
-    methods = ["maskvd"]
+    methods = ["ours", "eventful", "maskvd"]
+    # methods = ["vanilla"]
+    # methods = ["ours"]
 
     for mname, model_class in models_dict.items():
         model = model_class("cuda")
