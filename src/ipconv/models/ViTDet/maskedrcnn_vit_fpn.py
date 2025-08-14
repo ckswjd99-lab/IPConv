@@ -76,15 +76,22 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         self.add_decomposed_rel_pos = AddDecomposedRelPos()
 
     def forward(self, image_ndarray: np.ndarray, *args, **kwargs):
+        only_backbone = kwargs.get("only_backbone", False)
+
         # image_ndarray: (H, W, C)
         image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8, device=self.device).permute(2, 0, 1)
         input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
         
-        detections = self.base_model(input)
-
-        only_backbone = kwargs.get("only_backbone", False)
+        # detections = self.base_model(input)
+        images = self.base_model.preprocess_image(input)
+        features = self.base_model.backbone(images.tensor)
+        
         if only_backbone:
             return ([], [], []), {}
+        
+        proposals, _ = self.proposal_generator(images, features, None)
+        results, _ = self.roi_heads(images, features, proposals, None)
+        detections = self._postprocess(results, input, images.image_sizes)
 
         predictions = detections[0]
         boxes = predictions["instances"].pred_boxes.tensor.cpu().numpy()
