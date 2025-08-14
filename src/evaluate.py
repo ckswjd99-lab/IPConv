@@ -60,6 +60,8 @@ def evaluate_sequence(
 
     if method == "maskvd":
         maskvd_heatmap = np.load("maskvd_heatmap.npy")
+        maskvd_heatmap = (maskvd_heatmap - maskvd_heatmap.min()) / (maskvd_heatmap.max() - maskvd_heatmap.min())
+
         hmap_H, hmap_W = maskvd_heatmap.shape[:2]
         heatmap = np.zeros((1024, 1024), dtype=np.float32)
         # place at center
@@ -331,8 +333,6 @@ def evaluate_sequence(
         
         recomp_rate_list.append(dmap_recompute.mean().item())
 
-    #os.system(f"ffmpeg -framerate {frame_rate} -i temp/{sequence_name}_%04d.jpg -c:v libx264 -pix_fmt yuv420p temp/{sequence_name}_{frame_rate}fps.mp4 -y")
-
 
 def evaluate(
     model, 
@@ -352,7 +352,7 @@ def evaluate(
     for sequence_name, sequence_data in dataset.items():
         if sequence_name == "name": continue
 
-        dataset_name = dataset.get("name", "imnetvid")
+        dataset_name = "davis2017_trainval"  # Default dataset name, can be changed based on the dataset structure
         for frame_rate in frame_rates:
             print(f"Evaluating sequence: {sequence_name}, frame rate: {frame_rate} fps")
             evaluate_sequence(model, sequence_name, sequence_data, frame_rate, method, dataset_name=dataset_name, **kwargs)

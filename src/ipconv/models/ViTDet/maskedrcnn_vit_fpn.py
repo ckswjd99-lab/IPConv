@@ -618,11 +618,13 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
 
             else:   # global attention
                 q_selected = q[:, selected_indices, :]
+                k_selected = k[:, selected_indices, :]
                 num_selected = q_selected.shape[1]
 
-                attn_selected = self.matmul((q_selected * block.attn.scale), k.transpose(-2, -1))
+                attn_selected = self.matmul((q_selected * block.attn.scale), k_selected.transpose(-2, -1))
                 attn = torch.zeros(B_attn * block.attn.num_heads, H_attn * W_attn, H_attn * W_attn, device=self.device, dtype=x_attn.dtype)
-                attn[:, selected_indices, :] = attn_selected
+                attn[:, selected_indices[:, None], selected_indices[None, :]] = attn_selected
+
 
                 if block.attn.use_rel_pos:
                     attn = self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn), dmap_now)
