@@ -41,11 +41,29 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
         self.matmul = CountedMatmul()
         self.add_decomposed_rel_pos = AddDecomposedRelPos()
 
-    def forward(self, image_ndarray: np.ndarray):
+    def forward(self, image_ndarray: np.ndarray, **kwargs):
+        only_backbone = kwargs.get("only_backbone", False)
+
         image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8, device=self.device).permute(2, 0, 1)
         input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
         
-        detections = self.base_model(input)
+        # detections = self.base_model(input)
+        images = [self.base_model._move_to_current_device(x["image"]) for x in input]
+        images = [(x - self.base_model.pixel_mean) / self.base_model.pixel_std for x in images]
+        images = ImageList.from_tensors(
+            images,
+            self.base_model.backbone.size_divisibility,
+            padding_constraints={"size_divisibility": self.base_model.backbone.size_divisibility, "padding_constraints": image_ndarray.shape[0]},
+        )
+
+        features = self.base_model.backbone(images.tensor)
+        
+        if only_backbone:
+            return ([], [], []), {}
+
+        proposals, _ = self.proposal_generator(images, features, None)
+        results, _ = self.roi_heads(images, features, proposals, None)
+        detections = self._postprocess(results, input, images.image_sizes)
 
         predictions = detections[0]
         boxes = predictions["instances"].pred_boxes.tensor.cpu().numpy()
@@ -1053,7 +1071,7 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
                     x_windows = anchor_features[fname].clone()
                     x_windows[dindice_for_embeddings, :] = qkv_sel
                 else:
-                    x_windows = torch.zeros(ATTN_B_, ATTN_N * ATTN_C * 3, device=x.device)
+                    x_windows = torch.zeros(ATTN_B_, ATTN_N, ATTN_C, device=x.device)
                     x_windows[dindice_for_embeddings, :] = x_windows_sel
                 new_cache_feature[fname] = x_windows.clone()
 
