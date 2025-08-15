@@ -129,7 +129,7 @@ class CountedLinear(ExtendedModule):
     Linear transform operation that counts flops.
     """
 
-    def __init__(self, in_features, out_features, device=None, dtype=None):
+    def __init__(self, in_features, out_features, device=None, dtype=None, bias=True):
         """
         :param in_features: Dimensionality of input vectors
         :param out_features: Dimensionality of output vectors
@@ -164,7 +164,7 @@ class CountedLinear(ExtendedModule):
 
 class MlpWithCountedLinear(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None,
-                 act_layer=nn.GELU):
+                 act_layer=nn.GELU, drop=0.0):
         super().__init__()
         hidden_features = hidden_features or in_features
         out_features = out_features or in_features

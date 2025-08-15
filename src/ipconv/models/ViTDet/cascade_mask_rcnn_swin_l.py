@@ -20,14 +20,14 @@ from .cascade_mask_rcnn_swin import CascadeMaskRCNN_Swin_Contexted
 
 import pickle
 
-def make_cascade_mask_rcnn_swin_b():
+def make_cascade_mask_rcnn_swin_l():
     num_classes = 80
 
     swin_b = SwinTransformer(
         depths=[2, 2, 18, 2],
         drop_path_rate=0.4,
-        embed_dim=128,
-        num_heads=[4, 8, 16, 32],
+        embed_dim=192,
+        num_heads=[6, 12, 24, 48],
     )
 
     model = GeneralizedRCNN(
@@ -114,12 +114,12 @@ def make_cascade_mask_rcnn_swin_b():
 
     return model
 
-class CascadeMaskRCNN_Swin_B_Contexted(CascadeMaskRCNN_Swin_Contexted):
+class CascadeMaskRCNN_Swin_L_Contexted(CascadeMaskRCNN_Swin_Contexted):
     def __init__(self, device="cuda"):
-        super(CascadeMaskRCNN_Swin_B_Contexted, self).__init__()
-        self.base_model = make_cascade_mask_rcnn_swin_b().to(device)
+        super(CascadeMaskRCNN_Swin_L_Contexted, self).__init__()
+        self.base_model = make_cascade_mask_rcnn_swin_l().to(device)
 
-    def load_weight(self, weight_pkl_path='./model_final_246a82.pkl'):
+    def load_weight(self, weight_pkl_path='./model_final_7c897e.pkl'):
         with open(weight_pkl_path, 'rb') as f:
             weights = pickle.load(f)['model']
 

@@ -189,9 +189,11 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
                 dmap_broadcastable = dmap_channeled.unsqueeze(0).unsqueeze(2).unsqueeze(-1)
                 kv_cached = anchor_features[fname]
                 qkv_cached = torch.zeros_like(qkv)
-                qkv_cached[1:] = self.add(qkv[1:] * dmap_broadcastable, kv_cached * (1 - dmap_broadcastable))
+                # qkv_cached[1:] = self.add(qkv[1:] * dmap_broadcastable, kv_cached * (1 - dmap_broadcastable))
+                qkv_cached = self.add(qkv * dmap_broadcastable, kv_cached * (1 - dmap_broadcastable))
                 qkv = qkv_cached
-            new_cache_feature[fname] = qkv.clone()[1:]
+            # new_cache_feature[fname] = qkv.clone()[1:]
+            new_cache_feature[fname] = qkv.clone()
 
             fname = f"block{bidx}_qkvpe"
             if fname in anchor_features:
@@ -202,10 +204,10 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
                 else:
                     ape_block = ape
                 # disable for latency measurement: can be done offline
-                # ape_block = block.attn.qkv(ape_block).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # ape_block with shape (3, B_attn, nHead, H_attn * W_attn, C)
+                ape_block = block.attn.qkv(ape_block).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # ape_block with shape (3, B_attn, nHead, H_attn * W_attn, C)
                 
-                new_cache_feature[fname] = ape_block.clone()[1:]  # for strict cache size management
-                # new_cache_feature[fname] = ape_block.clone() # for easy inference
+                # new_cache_feature[fname] = ape_block.clone()[1:]  # for strict cache size management
+                new_cache_feature[fname] = ape_block.clone() # for easy inference
 
             fname = f"block{bidx}_std"
             x_std, _ = window_partition(x_std, block.window_size) if block.window_size > 0 else (x_std, None)
