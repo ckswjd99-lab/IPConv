@@ -370,7 +370,6 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             # > EncoderBlock
             shortcut = x
 
-            x_std = torch.std(x, dim=-1, keepdim=True)
             x = block.norm1(x)
 
             # Window partition

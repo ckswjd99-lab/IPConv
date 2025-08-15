@@ -21,9 +21,11 @@ from typing import List, Dict, Any, Tuple
 from datasets.vid import VIDResize, VID
 from ipconv.models import (
     ViTDeT_b_Imagenet_Contexted, MaskedRCNN_ViT_B_FPN_Contexted, MaskedRCNN_ViT_L_FPN_Contexted, MaskedRCNN_ViT_H_FPN_Contexted,
-    CascadeMaskRCNN_Swin_B_Contexted, DINO_4Scale_Swin_Contexted, DINO_5Scale_Swin_Contexted,
+    CascadeMaskRCNN_Swin_B_Contexted, CascadeMaskRCNN_Swin_L_Contexted, 
+    DINO_4Scale_Swin_Contexted, DINO_5Scale_Swin_Contexted,
     LWDETR_xLarge_Contexted
 )
+from ipconv.models.ViTDet.modeling.backbone.utils import window_reverse, window_partition
 
 
 def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, Dict[str, int]]]]]:
@@ -39,13 +41,17 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
         "vitdet-h": MaskedRCNN_ViT_H_FPN_Contexted,
         "dino-swin4": DINO_4Scale_Swin_Contexted,
         "lwdetr": LWDETR_xLarge_Contexted,
+        "swin-b": CascadeMaskRCNN_Swin_B_Contexted,
+        "swin-l": CascadeMaskRCNN_Swin_L_Contexted,
     }
 
     models_weight_dict = {
         "vitdet-b-imnetvid": "./weights/frcnn_vitdet_final.pth",  # 이 부분!
         "vitdet-b": "./weights/model_final_61ccd1.pkl",  # 이 부분!
         "vitdet-l": "./weights/model_final_6146ed.pkl",
-        "vitdet-h": "./weights/model_final_7224f1.pkl"
+        "vitdet-h": "./weights/model_final_7224f1.pkl",
+        "swin-b": "./weights/model_final_246a82.pkl",
+        "swin-l": "./weights/model_final_7c897e.pkl",
     }
 
     models_settings_dict = {
@@ -324,6 +330,53 @@ def shift_anchor_features(
             value = value.roll(shifts=(-shift_y, -shift_x), dims=(1, 2))
             if ape is not None:
                 value += ape
+            anchor_features[key] = value
+    
+    return anchor_features
+
+def shift_anchor_features_swin(
+        anchor_features: dict, 
+        shift_x: int, 
+        shift_y: int, 
+) -> dict:
+    """
+    anchor_features의 모든 qkv/out 텐서를 shift_x, shift_y만큼 블록 단위로 이동시킴.
+    """
+    for key, value in anchor_features.items():
+        if "qkv" in key and "meta" not in key:
+            lidx = int(key.split("layer")[-1].split("_")[0])
+            bidx = int(key.split("block")[-1].split("_")[0])
+
+            metadata = anchor_features.get(f"{key}_meta", None)
+            ATTN_B_ = metadata["ATTN_B_"]
+            ATTN_N = metadata["ATTN_N"]
+            ATTN_C = metadata["ATTN_C"]
+            window_size = metadata["window_size"]
+            Hp = metadata["Hp"]
+            Wp = metadata["Wp"]
+            sqrt_n = int(math.sqrt(ATTN_N))
+
+            shift_x_block = shift_x >> lidx
+            shift_y_block = shift_y >> lidx
+
+            qkv = value.reshape(ATTN_B_, sqrt_n, sqrt_n, ATTN_C * 3)
+            qkv_unwin = window_reverse(qkv, window_size, Hp, Wp)
+
+            qkv_unwin = qkv_unwin.roll(shifts=(-shift_y_block, -shift_x_block), dims=(1, 2))
+
+            qkv, _ = window_partition(qkv_unwin, window_size)
+            qkv = qkv.reshape(ATTN_B_, -1)
+
+            anchor_features[key] = qkv
+        if "out" in key:
+            # value: (B, H, W, C)
+            sqrt_n = int(math.sqrt(value.shape[0]))
+            shift_x_block = shift_x >> lidx
+            shift_y_block = shift_y >> lidx
+
+            value = value.reshape(1, sqrt_n, sqrt_n, -1)
+            value = value.roll(shifts=(-shift_x, -shift_y), dims=(1, 2))
+            value = value.reshape(sqrt_n * sqrt_n, -1)
             anchor_features[key] = value
     
     return anchor_features

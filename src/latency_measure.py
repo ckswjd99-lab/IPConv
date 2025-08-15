@@ -11,6 +11,7 @@ from typing import List, Dict, Any, Tuple
 
 from ipconv.models import (
     MaskedRCNN_ViT_B_FPN_Contexted, MaskedRCNN_ViT_L_FPN_Contexted, MaskedRCNN_ViT_H_FPN_Contexted,
+    CascadeMaskRCNN_Swin_B_Contexted, CascadeMaskRCNN_Swin_L_Contexted,
 )
 
 def measure_latency_memory(
@@ -74,9 +75,11 @@ def measure_latency_memory(
 @torch.no_grad()
 def main():
     models_dict = {
-        "ViT-base": MaskedRCNN_ViT_B_FPN_Contexted,
-        "ViT-large": MaskedRCNN_ViT_L_FPN_Contexted,
-        "ViT-huge": MaskedRCNN_ViT_H_FPN_Contexted,
+        # "ViT-base": MaskedRCNN_ViT_B_FPN_Contexted,
+        # "ViT-large": MaskedRCNN_ViT_L_FPN_Contexted,
+        # "ViT-huge": MaskedRCNN_ViT_H_FPN_Contexted,
+        "Swin-base": CascadeMaskRCNN_Swin_B_Contexted,
+        "Swin-large": CascadeMaskRCNN_Swin_L_Contexted,
     }
 
     keep_rates = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
@@ -84,7 +87,7 @@ def main():
 
     # methods = ["ours", "eventful", "maskvd", "stgt"]
     # methods = ["vanilla"]
-    methods = ["stgt"]
+    methods = ["ours"]
 
     input_sizes = [1024, 672]
 

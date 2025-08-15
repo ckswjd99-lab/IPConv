@@ -26,6 +26,7 @@ from evaluate_funcs import (
     estimate_affine,
     refresh_placing_matrix,
     shift_anchor_features,
+    shift_anchor_features_swin,
     refresh_placing_matrix,
     create_dirtiness_map,
     create_sensitivity_map,
@@ -88,7 +89,7 @@ def evaluate_sequence(
         model.backbone.net.pos_embed,
         model.backbone.net.pretrain_use_cls_token,
         (input_img_size[0] // block_size, input_img_size[1] // block_size)
-    )
+    ) if "Swin" not in model.__class__.__name__ else None
 
     # variables
     frames_until_refresh = 0
@@ -158,9 +159,14 @@ def evaluate_sequence(
 
         # > Shift cached features and reference frame
         if shift_x != 0 or shift_y != 0:
-            cached_features_dict = shift_anchor_features(
-                cached_features_dict, shift_x, shift_y, ape
-            )
+            if "Swin" in model.__class__.__name__:
+                cached_features_dict = shift_anchor_features_swin(
+                    cached_features_dict, shift_x * (block_size // 4), shift_y * (block_size // 4)
+                )
+            else:
+                cached_features_dict = shift_anchor_features(
+                    cached_features_dict, shift_x, shift_y, ape
+                )
             if ref_frame_aligned is not None:
                 ref_frame_aligned = np.roll(ref_frame_aligned, shift=(-shift_y * block_size, -shift_x * block_size), axis=(0, 1))
             if sensitivity_map is not None:
@@ -373,6 +379,7 @@ def main(args):
         print(s, file=file, flush=flush)
 
     model, dataset, settings_dict = prepare_environment(args)
+    model.eval()
 
     counts = evaluate(model, dataset, args.frame_rates, args.method, **settings_dict)
 
@@ -419,9 +426,9 @@ def parse_str_list(value):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate a model on a dataset.")
     parser.add_argument("--model", type=str, default="vitdet-b", help="Model to use for evaluation.",
-        choices=["vitdet-b", "vitdet-l", "vitdet-h", "dino-swin4", "lwdetr"],
+        choices=["vitdet-b", "vitdet-l", "vitdet-h", "dino-swin4", "lwdetr", "swin-b", "swin-l"],
     )
-    parser.add_argument("--dataset", type=str, default="davis2017_trainval", help="Dataset to evaluate on.",
+    parser.add_argument("--dataset", type=str, default="DAVIS2017_trainval", help="Dataset to evaluate on.",
         choices=["DAVIS2017_trainval", "DAVIS2019_challenge", "DAVIS2019_testdev"],
     )
     parser.add_argument("--frame-rates", type=parse_int_list, default=[100], 

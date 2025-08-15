@@ -278,7 +278,7 @@ def single_inference(
     
 
 @torch.no_grad()
-def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_dir="./output/contexted_inference_swinb"):
+def validate_DAVIS(model, sequence_name, gop, data_root="./data/DAVIS2017_trainval", output_dir="./output/contexted_inference_swinb"):
     # constants
     fixed_image_size = (1024, 1024)
     basic_scaling_factor = 1.05
@@ -464,18 +464,18 @@ def validate_DAVIS(model, sequence_name, gop, data_root="/data/DAVIS", output_di
 
 def main():
 
-    data_root = "/data/DAVIS"
+    data_root = "./data/DAVIS2017_trainval"
     output_dir = "./output/contexted_inference_swinb"
 
     model = CascadeMaskRCNN_Swin_B_Contexted(device="cuda")
     model.load_weight("./ipconv/models/model_final_246a82.pkl")
     model.eval()
 
-    # sequence_names = sorted(os.listdir("/data/DAVIS/JPEGImages/480p"))
+    # sequence_names = sorted(os.listdir("/data/DAVIS2017_trainval/JPEGImages/480p"))
     # sequence_names = sequence_names[64:]
-    sequence_names = ["flamingo"]
+    sequence_names = ["bear"]
     # gops = [1, 2, 3, 6, 30, 100]
-    gops = [1]
+    gops = [30]
 
     log_text = "Sequence, "
     for gop in gops:
