@@ -169,6 +169,14 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
             short_edge_length=640, max_size=int(1024 * 0.9)
         ),
         )
+
+    
+    if args.dataset == "highway":
+        dataset_dict = "/home/nxc/sooyoung7896/data/highway"
+
+        
+    if args.dataset == "city_drive":
+        dataset_dict = "/home/nxc/sooyoung7896/data/city_drive"
         
 
     return model, dataset_dict, settings_dict
