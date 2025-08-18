@@ -191,7 +191,7 @@ def estimate_affine(prev_nd, curr_nd):
     curr_g = cv2.resize(cv2.cvtColor(curr_nd, cv2.COLOR_BGR2GRAY), None, fx=DOWNSCALE, fy=DOWNSCALE, interpolation=cv2.INTER_AREA)
 
     p0 = cv2.goodFeaturesToTrack(prev_g, MAX_PTS, QUALITY, 7)
-    if p0 is None:  return np.eye(2, 3, np.float32)
+    if p0 is None:  return np.eye(2, 3, dtype=np.float32)
     p1, st, _ = cv2.calcOpticalFlowPyrLK(prev_g, curr_g, p0, None,
                                          winSize=LK_WIN, maxLevel=3)
     ok = st.squeeze() == 1

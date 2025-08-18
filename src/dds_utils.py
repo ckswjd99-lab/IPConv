@@ -514,7 +514,7 @@ def compress_and_get_size(images_path, start_id, end_id, qp,
             encoding_result = subprocess.run(["ffmpeg", "-y",
                                               "-loglevel", "error",
                                               "-start_number", str(start_id),
-                                              '-i', f"{images_path}/%010d.png",
+                                              '-i', f"{images_path}/frame_%05d.png",
                                               "-vcodec", "libx264", "-g", "15",
                                               "-keyint_min", "15",
                                               "-pix_fmt", "yuv420p",
@@ -529,7 +529,7 @@ def compress_and_get_size(images_path, start_id, end_id, qp,
             encoding_result = subprocess.run(["ffmpeg", "-y",
                                               "-loglevel", "error",
                                               "-start_number", str(start_id),
-                                              '-i', f"{images_path}/%010d.png",
+                                              '-i', f"{images_path}/frame_%05d.png",
                                               "-vcodec", "libx264",
                                               "-g", "15",
                                               "-keyint_min", "15",
@@ -545,7 +545,7 @@ def compress_and_get_size(images_path, start_id, end_id, qp,
     else:
         encoding_result = subprocess.run(["ffmpeg", "-y",
                                           "-start_number", str(start_id),
-                                          "-i", f"{images_path}/%010d.png",
+                                          "-i", f"{images_path}/frame_%05d.png",
                                           "-loglevel", "error",
                                           "-vcodec", "libx264",
                                           "-pix_fmt", "yuv420p", "-crf", "23",
@@ -607,7 +607,7 @@ def extract_images_from_video(images_path, req_regions):
 
     for fid, fname in fids_mapping:
         os.rename(os.path.join(f"{fname}_temp"),
-                  os.path.join(images_path, f"{str(fid).zfill(10)}.png"))
+                  os.path.join(images_path, f"frame_{str(fid).zfill(5)}.png"))
 
 
 def crop_images(results, vid_name, images_direc, resolution=None):
@@ -619,7 +619,7 @@ def crop_images(results, vid_name, images_direc, resolution=None):
         if not (cached_image and
                 cached_image[0] == region.fid):
             image_path = os.path.join(images_direc,
-                                      f"{str(region.fid).zfill(10)}.png")
+                                      f"frame_{str(region.fid).zfill(5)}.png")
             cached_image = (region.fid, cv.imread(image_path))
 
         # Just move the complete image
@@ -656,7 +656,7 @@ def crop_images(results, vid_name, images_direc, resolution=None):
             # fy：height方向的缩放比例，如果它是0，那么它就会按照(double)dsize.height/src.rows来计算
             # cv.INTER_CUBIC 	双线性插值 ,放缩使用cv.INTER_CUBIC(较慢)和cv.INTER_LINEAR(较快效果也不错)。
             frame = im_to_write
-        cv.imwrite(os.path.join(vid_name, f"{str(idx).zfill(10)}.png"), frame,
+        cv.imwrite(os.path.join(vid_name, f"frame_{str(idx).zfill(5)}.png"), frame,
                    [cv.IMWRITE_PNG_COMPRESSION, 0])
 
     return frames_count
@@ -985,7 +985,7 @@ def visualize_regions(results, images_direc,
     fids = sorted(list(set([r.fid for r in results.regions])))
     while idx < len(fids):
         image_np = cv.imread(
-            os.path.join(images_direc, f"{str(fids[idx]).zfill(10)}.png"))
+            os.path.join(images_direc, f"frame_{str(fids[idx]).zfill(5)}.png"))
         width = image_np.shape[1]
         height = image_np.shape[0]
         regions = [r for r in results.regions if r.fid == fids[idx]]
@@ -1011,7 +1011,7 @@ def visualize_regions(results, images_direc,
 
 
 def visualize_single_regions(region, images_direc, label="debugging"):
-    image_path = os.path.join(images_direc, f"{str(region.fid).zfill(10)}.png")
+    image_path = os.path.join(images_direc, f"frame_{str(region.fid).zfill(5)}.png")
     image_np = cv.imread(image_path)
     width = image_np.shape[1]
     height = image_np.shape[0]

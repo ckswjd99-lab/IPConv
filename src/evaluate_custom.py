@@ -28,7 +28,7 @@ from evaluate_funcs import (
     expand_mask_neighbors
 )
 from ipconv.models.ViTDet.modeling.backbone.utils import get_abs_pos
-from dds_utils import Results, read_results_dict, evaluate, cleanup, Region
+from dds_utils import Results, read_results_dict, evaluate, cleanup, Region, compute_regions_size
 
 outputs = Results()
 labels = Results()
@@ -235,8 +235,8 @@ def evaluate_sequence(
         ## POSTPROCESS ##
         # > Create sensitivity map
         sensitivity_map = create_sensitivity_map(boxes_cont, scores_cont, input_img_size)
-        
 
+        '''
         ## VISUALIZE ##
         # > Draw the full border
         vis_image = image_placed.copy()
@@ -264,6 +264,7 @@ def evaluate_sequence(
         cv2.imwrite(f"temp/{sequence_name}_{idx:04d}.jpg", vis_image[:, :, ::-1])
 
         #print(f"Processed frame {idx} of sequence {sequence_name}, boxes: {len(boxes_cont)}")
+        '''
         
         ref_frame = image.copy()
         ref_frame_aligned = image_placed.copy()
@@ -305,7 +306,6 @@ def evaluate_sequence(
 
         frame_with_no_results = True
 
-        # 텐서를 CPU로 옮기고 numpy 배열로 변환
         boxes = result["boxes"].cpu().numpy()   # shape: (N, 4)
         labels = result["labels"].cpu().numpy() # shape: (N,)
         scores = result["scores"].cpu().numpy() # shape: (N,)
@@ -368,7 +368,7 @@ def load_gt_as_results(csv_path):
             gt_results.append(r)
     return gt_results, max_fid
 
-def evaluate(
+def evaluate_custom(
     model, 
     dataset: str,
     sequence_number: int,
@@ -379,9 +379,12 @@ def evaluate(
     sensi_expansion: int = 1,
     **kwargs: Any
 ):
+    bw = 0
     """
     Evaluate the model on the dataset at specified frame rates.
     """
+    global global_fid
+
     for i in range (sequence_number):
         images_direc = os.path.join(dataset, str(i), "frames_png")
         sequence_data = sorted(os.listdir(images_direc))
@@ -394,10 +397,14 @@ def evaluate(
             global_fid += 1
 
         # GT merge
-        labels_direc = os.path.join(dataset, "labels")
+        labels_direc = os.path.join(dataset, str(i), "labels")
         gt_results, max_fid = load_gt_as_results(labels_direc)
         for fid, dets in sorted(gt_results.regions_dict.items()):
             labels.regions_dict[global_fid - max_fid + fid - 1] = dets
+
+        encoded_video_size, _ = compute_regions_size(seq_pred, f"{i}-base-phase", images_direc,
+                                                    0.8, 26, True, True)
+        bw += encoded_video_size
         
     total_max_fid = max(labels.regions_dict.keys())
 
@@ -412,17 +419,30 @@ def evaluate(
         iou_thresh=args.iou_thresh
     )
 
-    print("\n[Overall Evaluation - Global IoU Matching]")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall   : {recall:.4f}")
-    print(f"F1-score : {f1:.4f}")
-    print(f"mAP50      : {mAP:.4f}")
+    output_str = (
+        f"\n[Overall Evaluation - {args.dataset}/{args.model}]\n"
+        f"Precision: {precision:.4f}\n"
+        f"Recall   : {recall:.4f}\n"
+        f"F1-score : {f1:.4f}\n"
+        f"mAP50    : {mAP:.4f}\n"
+        f"Bandwidth-dds_v. : {bw:.4f}\n"
+    )
+
+    print(output_str)
+
+    out_dir = f"output/{args.dataset}/{args.model}"
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{args.frame_rates}+{args.dirty_thres}.txt")
+
+    with open(out_path, "w") as f:
+        f.write(output_str)
+
 
 @torch.no_grad()
 def main(args):
 
     model, dataset, settings_dict = prepare_environment(args)
-    evaluate(model, dataset, args.sequence_number, args.frame_rates, args.dmap_type, args.dirty_thres, args.dirty_topk, args.sensi_expansion, **settings_dict)
+    evaluate_custom(model, dataset, args.sequence_number, args.frame_rates, args.dmap_type, args.dirty_thres, args.dirty_topk, args.sensi_expansion, **settings_dict)
     
 
 def parse_int_list(value):
@@ -439,7 +459,7 @@ if __name__ == "__main__":
         choices=["vitdet-b", "vitdet-l", "vitdet-h", "dino-swin4", "lwdetr"],
     )
     parser.add_argument("--dataset", type=str, default="highway", help="Dataset to evaluate on.",
-        choices=["davis", "imnet-vid", "highway", "city_drive"],
+        choices=["highway", "city_drive"],
     )
     parser.add_argument("--frame-rates", type=parse_int_list, default=[100], 
                        help="Frame rate(s) for evaluation. Comma-separated integers (e.g., 1,6,100).")
@@ -453,6 +473,11 @@ if __name__ == "__main__":
                        help="Top-k dirtiness for the dirtiness map. Default is 100.")
     parser.add_argument("--sensi-expansion", type=int, default=1,
                        help="Expansion factor for the sensitivity map. Default is 1.")
+    parser.add_argument("--gt_confid_thresh", type=float, default=0.5)
+    parser.add_argument("--mpeg_confid_thresh", type=float, default=0.5)
+    parser.add_argument("--max_area_thresh_gt", type=float, default=0.4)
+    parser.add_argument("--max_area_thresh_mpeg", type=float, default=0.4)
+    parser.add_argument("--iou_thresh", type=float, default=0.5)
     args = parser.parse_args()
 
     main(args)
