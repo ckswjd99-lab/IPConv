@@ -28,11 +28,61 @@ from evaluate_funcs import (
     expand_mask_neighbors
 )
 from ipconv.models.ViTDet.modeling.backbone.utils import get_abs_pos
-from dds_utils import Results, read_results_dict, evaluate, cleanup, Region, compute_regions_size
+from dds_utils import Results, read_results_dict, evaluate, cleanup, Region, compute_regions_size, compress_and_get_size
 
 outputs = Results()
 labels = Results()
 global_fid = 1
+dmap_dict = {}
+
+
+def save_dirty_patches(image_placed, dmap_recompute, save_dir, fid):
+    """
+    dmap_recompute == 1 인 영역만 남긴 frame 이미지를 저장
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    # dmap_recompute: [1, H/block, W/block, 1] (torch)
+    dmap_mask = dmap_recompute.squeeze().cpu().numpy()  # [H/block, W/block]
+    H, W = image_placed.shape[:2]
+
+    # upsample mask to full resolution
+    dmap_mask_up = cv2.resize(dmap_mask, (W, H), interpolation=cv2.INTER_NEAREST)
+    dmap_mask_up = (dmap_mask_up > 0.5).astype(np.uint8)
+
+    # 3-channel mask
+    dmap_mask_3c = np.repeat(dmap_mask_up[:, :, None], 3, axis=2)
+
+    # apply mask (dirty 영역만 남김)
+    dirty_only = image_placed * dmap_mask_3c
+
+    out_path = os.path.join(save_dir, f"frame_{fid:05d}.png")
+    cv2.imwrite(out_path, dirty_only)
+
+    return out_path
+
+
+def compute_bandwidth_for_dirty_regions(images_path, dmap_dict, start_id, end_id, qp=None, resolution=None):
+    """
+    dmap_dict: {fid: dmap_recompute tensor} 형태로 저장된 dict
+    """
+    temp_dir = os.path.join(images_path, "dirty_frames")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    for fid in range(start_id, end_id):
+        if fid not in dmap_dict:
+            continue
+        image_path = os.path.join(images_path, f"frame_{fid:05d}.png")
+        image = cv2.imread(image_path)
+        if image is None:
+            continue
+
+        dmap_recompute = dmap_dict[fid]
+        save_dirty_patches(image, dmap_recompute, temp_dir, fid)
+
+    size = compress_and_get_size(temp_dir, start_id, end_id, qp, resolution=resolution)
+
+    return size
 
 def pad_to_divisible(image: np.ndarray, size_divisibility: int = 32):
     h, w = image.shape[:2]
@@ -227,6 +277,8 @@ def evaluate_sequence(
         else:
             dmap_recompute = dmap
 
+        dmap_dict[fid] = dmap_recompute.cpu()
+
 
         ## INFERENCE ##
         (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_contexted(image_placed, cached_features_dict, dmap_recompute)
@@ -392,6 +444,10 @@ def evaluate_custom(
         model.eval()
         seq_pred = evaluate_sequence(images_direc, model, str(i), sequence_data, frame_rates[0], dmap_type, dirty_thres, dirty_topk, sensi_expansion, **kwargs)
 
+        out_dir = f"/home/nxc/sooyoung7896/IPConv/results/{args.dataset}/{args.model}"
+        os.makedirs(out_dir, exist_ok=True)
+        seq_pred.write(os.path.join(out_dir, "predictions"))
+
         for fid, dets in sorted(seq_pred.regions_dict.items()):
             outputs.regions_dict[global_fid] = dets
             global_fid += 1
@@ -402,9 +458,17 @@ def evaluate_custom(
         for fid, dets in sorted(gt_results.regions_dict.items()):
             labels.regions_dict[global_fid - max_fid + fid - 1] = dets
 
-        encoded_video_size, _ = compute_regions_size(seq_pred, f"{i}-base-phase", images_direc,
-                                                    0.8, 26, True, True)
-        bw += encoded_video_size
+        bw_size = compute_bandwidth_for_dirty_regions(
+            images_path=images_direc,
+            dmap_dict=dmap_dict,
+            start_id=1,
+            end_id=len(sequence_data),
+            qp=26,
+            resolution=None
+        )
+        print("Bandwidth (bytes):", bw_size)
+        bw += bw_size
+
         
     total_max_fid = max(labels.regions_dict.keys())
 
@@ -425,7 +489,7 @@ def evaluate_custom(
         f"Recall   : {recall:.4f}\n"
         f"F1-score : {f1:.4f}\n"
         f"mAP50    : {mAP:.4f}\n"
-        f"Bandwidth-dds_v. : {bw:.4f}\n"
+        f"Bandwidth-. : {bw:.4f}\n"
     )
 
     print(output_str)
