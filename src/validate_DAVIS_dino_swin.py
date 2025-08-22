@@ -305,7 +305,7 @@ def validate_DAVIS(
     model: DINO_4Scale_Swin_Contexted, 
     sequence_name, 
     gop, 
-    data_root="/data/DAVIS", 
+    data_root="./data/DAVIS2017_trainval", 
     output_dir="./output/contexted_inference_dino_swin"
 ):
     # constants
@@ -503,7 +503,7 @@ def validate_DAVIS(
 
 def main():
 
-    data_root = "/data/DAVIS"
+    data_root = "./data/DAVIS2017_trainval"
     output_dir = "./output/contexted_inference_dino_swin"
 
     model = DINO_4Scale_Swin_Contexted("cuda")
@@ -513,8 +513,8 @@ def main():
 
     # sequence_names = sorted(os.listdir("/data/DAVIS/JPEGImages/480p"))
     # sequence_names = sequence_names[64:]
-    sequence_names = ["bear", "camel", "skate-park", "tuk-tuk"]
-    # sequence_names = ["bear"]
+    # sequence_names = ["bear", "camel", "skate-park", "tuk-tuk"]
+    sequence_names = ["bear"]
     # gops = [1, 2, 3, 6, 30, 100]
     gops = [30]
 

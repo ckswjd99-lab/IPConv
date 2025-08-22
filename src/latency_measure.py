@@ -12,6 +12,7 @@ from typing import List, Dict, Any, Tuple
 from ipconv.models import (
     MaskedRCNN_ViT_B_FPN_Contexted, MaskedRCNN_ViT_L_FPN_Contexted, MaskedRCNN_ViT_H_FPN_Contexted,
     CascadeMaskRCNN_Swin_B_Contexted, CascadeMaskRCNN_Swin_L_Contexted,
+    CascadeMaskRCNN_MViT_B_Contexted
 )
 
 def measure_latency_memory(
@@ -54,7 +55,7 @@ def measure_latency_memory(
 
     start_time = time.time()
     for _ in tqdm(range(num_repeats), leave=False):
-        inference_func(dummy_input, dirtiness_map=dmap, only_backbone=True)
+        inference_func(dummy_input, dirtiness_map=dmap, only_backbone=True, anchor_features=output[1])
     end_time = time.time()
 
     cache_size = 0
@@ -78,8 +79,9 @@ def main():
         # "ViT-base": MaskedRCNN_ViT_B_FPN_Contexted,
         # "ViT-large": MaskedRCNN_ViT_L_FPN_Contexted,
         # "ViT-huge": MaskedRCNN_ViT_H_FPN_Contexted,
-        "Swin-base": CascadeMaskRCNN_Swin_B_Contexted,
-        "Swin-large": CascadeMaskRCNN_Swin_L_Contexted,
+        # "Swin-base": CascadeMaskRCNN_Swin_B_Contexted,
+        # "Swin-large": CascadeMaskRCNN_Swin_L_Contexted,
+        "MViT-B": CascadeMaskRCNN_MViT_B_Contexted,
     }
 
     keep_rates = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
@@ -89,7 +91,7 @@ def main():
     # methods = ["vanilla"]
     methods = ["ours"]
 
-    input_sizes = [1024, 672]
+    input_sizes = [1024]
 
     for mname, model_class in models_dict.items():
         model = model_class("cuda")

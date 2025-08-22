@@ -48,7 +48,7 @@ CLASSES = [
     "zebra",
 ]
 
-SPLITS = ["det_train", "vid_train", "vid_val", "vid_minival"]
+SPLITS = ["det_train", "vid_train", "vid_val", "vid_minival", "vid_cocoval"]
 
 
 class VID(Dataset):

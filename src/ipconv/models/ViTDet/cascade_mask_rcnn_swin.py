@@ -170,45 +170,13 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
                 # W-MSA/SW-MSA
                 ATTN_B_, ATTN_N, ATTN_C = x_windows.shape
 
-                dmap_for_embeddings = dmap_windows.mean(dim=-1).mean(dim=-1).mean(dim=-1)
-                dindice_for_embeddings = torch.nonzero(dmap_for_embeddings, as_tuple=False).view(-1)
-                num_sel_windows = dindice_for_embeddings.shape[0]
-                
-                x_windows_sel = x_windows.reshape(ATTN_B_, -1)
-                x_windows_sel = F.embedding(dindice_for_embeddings, x_windows_sel)
-                x_windows_sel = x_windows_sel.reshape(x_windows_sel.shape[0], ATTN_N, ATTN_C)
-                
-                qkv_sel = block.attn.qkv(x_windows_sel) # (ATTN_B_, ATTN_N, ATTN_C * 3)
-                qkv_sel = qkv_sel.reshape(num_sel_windows, -1)
-
-                fname = f"layer{lidx}_block{bidx}_qkv"
-                if fname in anchor_features:
-                    qkv_cached = anchor_features[fname]
-                    qkv = qkv_cached.clone()
-                    qkv[dindice_for_embeddings, :] = qkv_sel
-                else:
-                    qkv = torch.zeros(ATTN_B_, ATTN_N * ATTN_C * 3, device=x.device)
-                    qkv[dindice_for_embeddings, :] = qkv_sel
-                new_cache_feature[fname] = qkv.clone()
-                new_cache_feature[fname+"_meta"] = {
-                    "ATTN_B_": ATTN_B_,
-                    "ATTN_N": ATTN_N,
-                    "ATTN_C": ATTN_C,
-                    "window_size": block.window_size,
-                    "Hp": Hp,
-                    "Wp": Wp,
-                }
-
+                qkv = block.attn.qkv(x_windows) # (ATTN_B_, ATTN_N, 3 * ATTN_C)
                 qkv = qkv.reshape(ATTN_B_, ATTN_N, 3, block.attn.num_heads, ATTN_C // block.attn.num_heads).permute(2, 0, 3, 1, 4)
                 q, k, v = qkv[0], qkv[1], qkv[2]
 
                 # q: Tensor(ATTN_B_, block.attn.num_heads, ATTN_N, ATTN_C // block.attn.num_heads)
                 q = q * block.attn.scale
-                q_sel = q[dindice_for_embeddings, :, :]
-                k_sel = k[dindice_for_embeddings, :, :]
-                v_sel = v[dindice_for_embeddings, :, :]
-
-                attn_sel = self.matmul(q_sel, k_sel.transpose(-2, -1))
+                attn = self.matmul(q, k.transpose(-2, -1))
 
                 relative_position_bias = block.attn.relative_position_bias_table[
                     block.attn.relative_position_index.view(-1)
@@ -218,10 +186,7 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
                 relative_position_bias = relative_position_bias.permute(
                     2, 0, 1
                 ).contiguous()  # nH, Wh*Ww, Wh*Ww
-                attn_sel = self.add(attn_sel, relative_position_bias.unsqueeze(0))
-
-                attn = torch.zeros(ATTN_B_, block.attn.num_heads, ATTN_N, ATTN_N, device=x.device)
-                attn[dindice_for_embeddings, :, :] = attn_sel
+                attn = self.add(attn, relative_position_bias.unsqueeze(0))
 
                 if attn_mask is not None:
                     nW = attn_mask.shape[0]
@@ -233,16 +198,11 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
 
                 attn = block.attn.attn_drop(attn)
 
-                attn_sel = attn[dindice_for_embeddings, :, :]
-
-                x_windows = self.matmul(attn_sel, v_sel).transpose(1, 2).reshape(num_sel_windows, ATTN_N, ATTN_C)
+                x_windows = self.matmul(attn, v).transpose(1, 2).reshape(ATTN_B_, ATTN_N, ATTN_C)
                 x_windows = block.attn.proj(x_windows)
                 x_windows = block.attn.proj_drop(x_windows)
 
-                attn_windows = torch.zeros(ATTN_B_, block.window_size * block.window_size, Block_C, device=x.device)
-                attn_windows[dindice_for_embeddings, :] = x_windows
-
-                # attn_windows = x_windows
+                attn_windows = x_windows
 
                 # merge windows
                 attn_windows = attn_windows.view(-1, block.window_size, block.window_size, Block_C)
@@ -709,24 +669,24 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
                 dindice_for_embeddings = torch.nonzero(dmap_for_embeddings, as_tuple=False).view(-1)
                 num_sel_windows = dindice_for_embeddings.shape[0]
                 
+
                 x_windows_sel = x_windows.reshape(ATTN_B_, -1)
-                x_windows_sel = F.embedding(dindice_for_embeddings, x_windows_sel)
+                fname = f"layer{lidx}_block{bidx}_dindice_for_embeddings"
+                if fname in anchor_features:
+                    x_windows_cached = anchor_features[fname]
+                    x_windows_cached[dindice_for_embeddings] = x_windows_sel[dindice_for_embeddings]
+                    x_windows_sel = x_windows_cached
+                new_cache_feature[fname] = x_windows_sel.clone()
+
                 x_windows_sel = x_windows_sel.reshape(x_windows_sel.shape[0], ATTN_N, ATTN_C)
                 
                 qkv_sel = block.attn.qkv(x_windows_sel) # (ATTN_B_, ATTN_N, ATTN_C * 3)
-                qkv_sel = qkv_sel.reshape(num_sel_windows, -1)
+                qkv_sel = qkv_sel.reshape(ATTN_B_, -1)
 
-                qkv = torch.zeros(ATTN_B_, ATTN_N * ATTN_C * 3, device=x.device)
-                qkv[dindice_for_embeddings, :] = qkv_sel
-
-                qkv = qkv.reshape(ATTN_B_, ATTN_N, 3, block.attn.num_heads, ATTN_C // block.attn.num_heads).permute(2, 0, 3, 1, 4)
-                q, k, v = qkv[0], qkv[1], qkv[2]
-
-                # q: Tensor(ATTN_B_, block.attn.num_heads, ATTN_N, ATTN_C // block.attn.num_heads)
-                q = q * block.attn.scale
-                q_sel = q[dindice_for_embeddings, :, :]
-                k_sel = k[dindice_for_embeddings, :, :]
-                v_sel = v[dindice_for_embeddings, :, :]
+                qkv_sel = qkv_sel.reshape(ATTN_B_, ATTN_N, 3, block.attn.num_heads, ATTN_C // block.attn.num_heads).permute(2, 0, 3, 1, 4)
+                q_sel = qkv_sel[0] * block.attn.scale
+                k_sel = qkv_sel[1]
+                v_sel = qkv_sel[2]
 
                 attn_sel = self.matmul(q_sel, k_sel.transpose(-2, -1))
 
@@ -738,10 +698,7 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
                 relative_position_bias = relative_position_bias.permute(
                     2, 0, 1
                 ).contiguous()  # nH, Wh*Ww, Wh*Ww
-                attn_sel = self.add(attn_sel, relative_position_bias.unsqueeze(0))
-
-                attn = torch.zeros(ATTN_B_, block.attn.num_heads, ATTN_N, ATTN_N, device=x.device)
-                attn[dindice_for_embeddings, :, :] = attn_sel
+                attn = self.add(attn_sel, relative_position_bias.unsqueeze(0))
 
                 if attn_mask is not None:
                     nW = attn_mask.shape[0]
@@ -753,16 +710,11 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
 
                 attn = block.attn.attn_drop(attn)
 
-                attn_sel = attn[dindice_for_embeddings, :, :]
-
-                x_windows = self.matmul(attn_sel, v_sel).transpose(1, 2).reshape(num_sel_windows, ATTN_N, ATTN_C)
+                x_windows = self.matmul(attn, v_sel).transpose(1, 2).reshape(ATTN_B_, ATTN_N, ATTN_C)
                 x_windows = block.attn.proj(x_windows)
                 x_windows = block.attn.proj_drop(x_windows)
 
-                attn_windows = torch.zeros(ATTN_B_, block.window_size * block.window_size, Block_C, device=x.device)
-                attn_windows[dindice_for_embeddings, :] = x_windows
-
-                # attn_windows = x_windows
+                attn_windows = x_windows
 
                 # merge windows
                 attn_windows = attn_windows.view(-1, block.window_size, block.window_size, Block_C)
@@ -789,18 +741,6 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
                 x_sel = self.add(x_sel, mlp_x_selected)
 
                 x.view(-1, Block_C)[dindice_for_embeddings] = x_sel
-                
-                # fname = f"layer{lidx}_block{bidx}_ffn_out"
-                # if fname in anchor_features:
-                #     x_cached = anchor_features[fname].clone()
-                #     x_cached[dindice_for_embeddings] = x_sel
-                #     x = x_cached
-                # else:
-                #     x_cached = x.view(-1, Block_C).clone()
-                #     x_cached[dindice_for_embeddings] = x_sel
-                #     x = x_cached
-                # new_cache_feature[fname] = x.clone()
-                # x = x.unsqueeze(0)
 
             # x: (B, H*W, C)
             fname = f"layer{lidx}_out"

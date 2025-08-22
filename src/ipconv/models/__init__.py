@@ -8,3 +8,4 @@ from .DINO.dino_4scale_swin import DINO_4Scale_Swin_Contexted
 from .DINO.dino_5scale_swin import DINO_5Scale_Swin_Contexted
 from .LW_DETR.lwdetr_xlarge import LWDETR_xLarge_Contexted
 from .ViTDet.vit_b_imagenet import ViTDeT_b_Imagenet_Contexted
+from .ViTDet.cascade_mask_rcnn_mvit_b import CascadeMaskRCNN_MViT_B_Contexted

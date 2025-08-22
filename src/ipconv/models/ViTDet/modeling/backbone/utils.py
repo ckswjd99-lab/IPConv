@@ -367,3 +367,14 @@ def shrink_mask_neighbors(mask_4d: torch.Tensor) -> torch.Tensor:
     shrunk = shrunk.permute(0, 2, 3, 1)
     
     return shrunk
+
+def attention_pool(x, pool, norm=None):
+    # (B, H, W, C) -> (B, C, H, W)
+    x = x.permute(0, 3, 1, 2)
+    x = pool(x)
+    # (B, C, H1, W1) -> (B, H1, W1, C)
+    x = x.permute(0, 2, 3, 1)
+    if norm:
+        x = norm(x)
+
+    return x

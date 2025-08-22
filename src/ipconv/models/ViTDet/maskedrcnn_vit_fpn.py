@@ -29,7 +29,7 @@ from ..proc_image import (
 )
 
 class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
-    def __init__(self, device="cuda"):
+    def __init__(self, device="cuda:1", dataset_name="coco"):
         super().__init__()
         self.idx = 0
 
@@ -49,6 +49,14 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone',
             'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book',
             'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+        ]
+        self.VID_LABELS_LIST = [
+            "airplane", "antelope", "bear", "bicycle", "bird",
+            "bus", "car", "cattle", "dog", "domestic_cat",
+            "elephant", "fox", "giant_panda", "hamster", "horse",
+            "lion", "lizard", "monkey", "motorcycle", "rabbit",
+            "red_panda", "sheep", "snake", "squirrel", "tiger",
+            "train", "turtle", "watercraft", "whale", "zebra",
         ]
 
         np.random.seed(42)
@@ -111,7 +119,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             self, 
             image_ndarray: np.ndarray, 
             anchor_features: Dict[str, torch.Tensor] = {},
-            dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda"),
+            dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda:1"),
             only_backbone: bool = False,
     ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], Dict[str, torch.Tensor]]:
         # image_ndarray: (H, W, C)
@@ -203,6 +211,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
                     ape_block, _ = window_partition(ape, block.window_size)
                 else:
                     ape_block = ape
+                ape_block = ape_block * block.norm1.weight
                 # disable for latency measurement: can be done offline
                 ape_block = block.attn.qkv(ape_block).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # ape_block with shape (3, B_attn, nHead, H_attn * W_attn, C)
                 
@@ -325,7 +334,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             self, 
             image_ndarray: np.ndarray, 
             anchor_features: Dict[str, torch.Tensor] = {},
-            dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda"),
+            dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda:1"),
             only_backbone: bool = False,
     ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], Dict[str, torch.Tensor]]:
         # image_ndarray: (H, W, C)
@@ -360,7 +369,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         # x: Tensor(1, 64, 64, 768)
         # dirtiness_map: Tensor(1, 64, 64, 1)
 
-        dmap_block = dirtiness_map.clone()
+        dmap_block = dirtiness_map
         dmap_window, _ = window_partition(dmap_block, net.blocks[0].window_size)
 
         dindice_block = torch.nonzero(dmap_block.view(-1) == 1, as_tuple=False).squeeze(-1)
@@ -401,7 +410,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
                 dmap_channeled = dmap_now.reshape(B_attn, H_attn * W_attn)
                 dmap_broadcastable = dmap_channeled.unsqueeze(0).unsqueeze(2).unsqueeze(-1)
                 qkv = self.add(qkv * dmap_broadcastable, anchor_features[fname] * (1 - dmap_broadcastable))
-            new_cache_feature[fname] = qkv.clone()
+            new_cache_feature[fname] = qkv
 
             q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)  # q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
 
@@ -415,13 +424,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
                 # projection
                 attn = attn.softmax(dim=-1)
                 x_attn = self.matmul(attn, v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
-
-                x_attn_flat = x_attn.reshape(-1, x_attn.shape[-1])
-                x_attn_selected = F.embedding(selected_indices, x_attn_flat)
-                x_attn_selected = block.attn.proj(x_attn_selected)
-                x_attn = torch.zeros(B_attn * H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=x_attn.dtype)
-                x_attn[selected_indices, :] = x_attn_selected.view(-1, x_attn_selected.shape[-1])
-                x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
+                x_attn = block.attn.proj(x_attn)
 
             else:   # global attention
                 fname = f"block{bidx}_qkv"
@@ -445,13 +448,13 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
                 attn = attn.softmax(dim=-1)
 
                 fname = f"block{bidx}_attn"
-                attn_cache = anchor_features[fname] if fname in anchor_features else torch.zeros_like(attn)
-                new_cache_feature[fname] = attn.clone()
+                attn_cache = anchor_features[fname] if fname in anchor_features else None
+                new_cache_feature[fname] = attn
 
                 # Attn_V update
                 fname = f"block{bidx}_attn_v"
-                AV_old = anchor_features[fname] if fname in anchor_features else torch.zeros_like(v)
-                AV_diff = self.add(attn, (-1) * attn_cache)
+                AV_old = anchor_features[fname] if fname in anchor_features else None
+                AV_diff = self.add(attn, (-1) * attn_cache) if attn_cache is not None else attn
                 AV_diff_selected = AV_diff[:, :, selected_indices]
 
                 v_cache_selected = v_cache[:, selected_indices, :]
@@ -462,9 +465,9 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
 
                 AV_update = self.matmul(AV_diff_selected, v_temp_selected)
 
-                AV = self.add(self.add(AV_old, AnVdiff), AV_update)
+                AV = self.add(self.add(AV_old, AnVdiff), AV_update) if AV_old is not None else self.add(AnVdiff, AV_update)
 
-                new_cache_feature[fname] = AV.clone()
+                new_cache_feature[fname] = AV
 
                 # projection
                 attn_selected = AV[:, selected_indices, :]
@@ -504,7 +507,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             # x: (1, 64, 64, 768), anchor_features[fname]: (1, 64, 64, 768)
             dmap_channeled = dmap_block.expand(-1, -1, -1, x.shape[-1])    # (1, 64, 64, 768)
             x = self.add(x * dmap_channeled, anchor_features[fname] * (1 - dmap_channeled))
-        new_cache_feature[fname] = x.clone()
+        new_cache_feature[fname] = x
 
         if only_backbone:
             return ([], [], []), new_cache_feature
@@ -548,7 +551,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             self, 
             image_ndarray: np.ndarray, 
             anchor_features: Dict[str, torch.Tensor] = {},
-            dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda"),
+            dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda:1"),
             only_backbone: bool = False,
     ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], Dict[str, torch.Tensor]]:
         # image_ndarray: (H, W, C)
@@ -583,7 +586,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         # x: Tensor(1, 64, 64, 768)
         # dirtiness_map: Tensor(1, 64, 64, 1)
 
-        dmap_block = dirtiness_map.clone()
+        dmap_block = dirtiness_map
         dmap_window, _ = window_partition(dmap_block, net.blocks[0].window_size)
 
         dindice_block = torch.nonzero(dmap_block.view(-1) == 1, as_tuple=False).squeeze(-1)
@@ -613,12 +616,18 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             # partial QKV generation
             x_attn_flat = x_attn.reshape(-1, self.embed_dim)
             x_attn_selected = F.embedding(selected_indices, x_attn_flat)
-            qkv_selected = block.attn.qkv(x_attn_selected)
 
-            qkv_flat = torch.zeros(B_attn * H_attn * W_attn, 3 * self.embed_dim, device=self.device, dtype=x_attn.dtype)
-            qkv_flat[selected_indices, :] = qkv_selected
-
-            qkv = qkv_flat.reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # qkv with shape (3, B_attn, nHead, H_attn * W_attn, C)
+            fname = f"block{bidx}_x_attn_flat"
+            if fname in anchor_features:
+                x_attn_flat_cached = anchor_features[fname]
+                x_attn_flat_cached[selected_indices] = x_attn_selected
+                x_attn_selected = x_attn_flat_cached
+            else:
+                x_attn_selected = x_attn_flat
+            new_cache_feature[fname] = x_attn_selected
+            
+            qkv = block.attn.qkv(x_attn_selected)
+            qkv = qkv.reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # qkv with shape (3, B_attn, nHead, H_attn * W_attn, C)
 
             q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)  # q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
 
@@ -734,7 +743,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             self, 
             image_ndarray: np.ndarray, 
             anchor_features: Dict[str, torch.Tensor] = {},
-            dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda"),
+            dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda:1"),
             only_backbone: bool = False,
     ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], Dict[str, torch.Tensor]]:
         # image_ndarray: (H, W, C)

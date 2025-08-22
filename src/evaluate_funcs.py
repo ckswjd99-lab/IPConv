@@ -21,7 +21,7 @@ from typing import List, Dict, Any, Tuple
 from datasets.vid import VIDResize, VID
 from ipconv.models import (
     ViTDeT_b_Imagenet_Contexted, MaskedRCNN_ViT_B_FPN_Contexted, MaskedRCNN_ViT_L_FPN_Contexted, MaskedRCNN_ViT_H_FPN_Contexted,
-    CascadeMaskRCNN_Swin_B_Contexted, CascadeMaskRCNN_Swin_L_Contexted, 
+    CascadeMaskRCNN_Swin_B_Contexted, CascadeMaskRCNN_Swin_L_Contexted, CascadeMaskRCNN_MViT_B_Contexted,
     DINO_4Scale_Swin_Contexted, DINO_5Scale_Swin_Contexted,
     LWDETR_xLarge_Contexted
 )
@@ -35,7 +35,7 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
 
     # Prepare model
     models_dict = {
-        "vitdet-b-imnetvid": ViTDeT_b_Imagenet_Contexted,
+        # "vitdet-b-imnetvid": ViTDeT_b_Imagenet_Contexted,
         "vitdet-b": MaskedRCNN_ViT_B_FPN_Contexted,
         "vitdet-l": MaskedRCNN_ViT_L_FPN_Contexted,
         "vitdet-h": MaskedRCNN_ViT_H_FPN_Contexted,
@@ -43,23 +43,25 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
         "lwdetr": LWDETR_xLarge_Contexted,
         "swin-b": CascadeMaskRCNN_Swin_B_Contexted,
         "swin-l": CascadeMaskRCNN_Swin_L_Contexted,
+        "mvit-b": CascadeMaskRCNN_MViT_B_Contexted,
     }
 
     models_weight_dict = {
-        "vitdet-b-imnetvid": "./weights/frcnn_vitdet_final.pth",  # 이 부분!
+        # "vitdet-b-imnetvid": "./weights/frcnn_vitdet_final.pth",  # 이 부분!
         "vitdet-b": "./weights/model_final_61ccd1.pkl",  # 이 부분!
         "vitdet-l": "./weights/model_final_6146ed.pkl",
         "vitdet-h": "./weights/model_final_7224f1.pkl",
         "swin-b": "./weights/model_final_246a82.pkl",
         "swin-l": "./weights/model_final_7c897e.pkl",
+        "mvit-b": "./weights/model_final_8c3da3.pkl",
     }
 
     models_settings_dict = {
-        "vitdet-b-imnetvid": {
-            "input_img_size": (1024, 1024),
-            "block_size": 16,
-            "background_color": (123.675, 116.28, 103.53)
-        },
+        # "vitdet-b-imnetvid": {
+        #     "input_img_size": (1024, 1024),
+        #     "block_size": 16,
+        #     "background_color": (123.675, 116.28, 103.53)
+        # },
         "vitdet-b": {
             "input_img_size": (1024, 1024),
             "block_size": 16,
@@ -84,13 +86,18 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
             "input_img_size": (1024, 1024),
             "block_size": 16,
             "background_color": (0, 0, 0)
-        }
+        },
+        "mvit-b": {
+            "input_img_size": (1024, 1024),
+            "block_size": 16,
+            "background_color": (123.675, 116.28, 103.53)
+        },
     }
 
     if args.model not in models_dict:
         raise ValueError(f"Unknown model: {args.model}")
 
-    model = models_dict[args.model]()
+    model = models_dict[args.model](args.device)
 
     if args.model in models_weight_dict:
         weight_path = models_weight_dict[args.model]
@@ -216,7 +223,8 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
     if args.dataset == "imnet-vid":
         dataset_dict = VID(
         Path("data", "vid"),
-        split="vid_val",
+        # split="vid_val",
+        split="vid_cocoval",
         tar_path=Path("data", "vid", "vid_data.tar"),
         combined_transform=VIDResize(
             short_edge_length=640, max_size=int(1024 * 0.9)
@@ -369,14 +377,17 @@ def shift_anchor_features_swin(
 
             anchor_features[key] = qkv
         if "out" in key:
+            lidx = int(key.split("layer")[-1].split("_")[0])
+            
             # value: (B, H, W, C)
+            BHW, C = value.shape
             sqrt_n = int(math.sqrt(value.shape[0]))
             shift_x_block = shift_x >> lidx
             shift_y_block = shift_y >> lidx
 
             value = value.reshape(1, sqrt_n, sqrt_n, -1)
             value = value.roll(shifts=(-shift_x, -shift_y), dims=(1, 2))
-            value = value.reshape(sqrt_n * sqrt_n, -1)
+            value = value.reshape(-1, C)
             anchor_features[key] = value
     
     return anchor_features
@@ -484,3 +495,49 @@ def expand_mask_neighbors(mask_4d: torch.Tensor, expansion: int = 1) -> torch.Te
     expanded = expanded.permute(0, 2, 3, 1)
     
     return expanded
+
+def objdet_coco_to_imvid(boxes, labels, scores):
+    COCO_LABELS_LIST = [
+        'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 
+        'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 
+        'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 
+        'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 
+        'frisbee', 'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 
+        'baseball glove', 'skateboard', 'surfboard', 'tennis racket', 'bottle', 
+        'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 
+        'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 
+        'cake', 'chair', 'couch', 'potted plant', 'bed', 'dining table', 'toilet', 
+        'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone', 'microwave', 
+        'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase', 
+        'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+    ]
+    VID_LABELS_LIST = [
+        "airplane", "antelope", "bear", "bicycle", "bird", "bus", "car", 
+        "cattle", "dog", "domestic_cat", "elephant", "fox", "giant_panda", 
+        "hamster", "horse", "lion", "lizard", "monkey", "motorcycle", "rabbit", 
+        "red_panda", "sheep", "snake", "squirrel", "tiger", "train", "turtle", 
+        "watercraft", "whale", "zebra"
+    ]
+
+    common_class_names = set(COCO_LABELS_LIST) & set(VID_LABELS_LIST)
+    common_coco_indices = {i for i, name in enumerate(COCO_LABELS_LIST) if name in common_class_names}
+
+    coco_name_to_idx = {name: i for i, name in enumerate(COCO_LABELS_LIST)}
+    vid_name_to_idx = {name: i for i, name in enumerate(VID_LABELS_LIST)}
+    
+    coco_idx_to_vid_idx = {
+        coco_name_to_idx[name]: vid_name_to_idx[name] for name in common_class_names
+    }
+
+    mask = np.isin(labels, list(common_coco_indices))
+
+    filtered_boxes = boxes[mask]
+    filtered_coco_labels = labels[mask]
+    filtered_scores = scores[mask]
+
+    if filtered_coco_labels.size > 0:
+        remapped_labels = np.array([coco_idx_to_vid_idx[coco_idx] for coco_idx in filtered_coco_labels])
+    else:
+        remapped_labels = filtered_coco_labels
+
+    return filtered_boxes, remapped_labels, filtered_scores

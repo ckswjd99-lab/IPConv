@@ -45,7 +45,7 @@ from ..proc_image import (
 from .maskedrcnn_vit_fpn import MaskedRCNN_ViT_FPN_Contexted
 
 class MaskedRCNN_ViT_H_FPN_Contexted(MaskedRCNN_ViT_FPN_Contexted):
-    def __init__(self, device="cuda:1"):
+    def __init__(self, device="cuda"):
         super().__init__()
         self.idx = 0
 

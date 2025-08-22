@@ -85,11 +85,23 @@ def evaluate_sequence(
         [0.0, 0.0, 1.0]
     ], dtype=np.float32)
 
-    ape = get_abs_pos(
-        model.backbone.net.pos_embed,
-        model.backbone.net.pretrain_use_cls_token,
-        (input_img_size[0] // block_size, input_img_size[1] // block_size)
-    ) if "Swin" not in model.__class__.__name__ else None
+    if "Swin" in model.__class__.__name__:
+        ape = None
+    elif "MViT" in model.__class__.__name__:
+        # print(model.base_model.backbone.bottom_up.pos_embed)
+        # print(model.base_model.backbone.bottom_up.pretrain_use_cls_token)
+        # ape = get_abs_pos(
+        #     model.base_model.backbone.bottom_up.pos_embed,
+        #     model.base_model.backbone.bottom_up.pretrain_use_cls_token,
+        #     (input_img_size[0] // block_size, input_img_size[1] // block_size)
+        # )
+        ape = None
+    else:
+        ape = get_abs_pos(
+            model.backbone.net.pos_embed,
+            model.backbone.net.pretrain_use_cls_token,
+            (input_img_size[0] // block_size, input_img_size[1] // block_size)
+        )
 
     # variables
     frames_until_refresh = 0
@@ -144,6 +156,7 @@ def evaluate_sequence(
         
         if method != "ours":
             placing_matrix = centering_matrix.copy()
+            shift_x, shift_y = 0, 0
 
         # > Place the image in the input
         image_placed = np.zeros((input_img_size[1], input_img_size[0], 3), dtype=np.uint8)
@@ -194,13 +207,13 @@ def evaluate_sequence(
                 )
 
             if isinstance(dmap_raw, np.ndarray):
-                dmap = torch.from_numpy(dmap_raw).to("cuda")
+                dmap = torch.from_numpy(dmap_raw).to("cuda:1")
             elif isinstance(dmap_raw, torch.Tensor):
-                dmap = dmap_raw.to("cuda")
+                dmap = dmap_raw.to("cuda:1")
             else:
                 raise TypeError("Unsupported type for dirtiness map")
         else:
-            dmap = torch.ones(1, 64, 64, 1, device="cuda")
+            dmap = torch.ones(1, 64, 64, 1, device="cuda:1")
 
         dmap_ndarray = dmap.squeeze().cpu().numpy()
         dmap_ndarray = cv2.resize(dmap_ndarray, (input_img_size[0], input_img_size[1]), interpolation=cv2.INTER_NEAREST)
@@ -217,24 +230,25 @@ def evaluate_sequence(
             sensi_map_downsized = cv2.resize(sensitivity_map, (input_img_size[0] // block_size, input_img_size[1] // block_size), interpolation=cv2.INTER_AREA)
             sensi_map_downsized = (sensi_map_downsized > 0.5).astype(np.float32)
             dmap_expanded = dmap_expanded * sensi_map_downsized + dmap.squeeze().cpu().numpy() * (1 - sensi_map_downsized)
-            dmap_recompute = torch.from_numpy(dmap_expanded).unsqueeze(0).unsqueeze(-1).to("cuda")
+            dmap_recompute = torch.from_numpy(dmap_expanded).unsqueeze(0).unsqueeze(-1).to("cuda:1")
         elif sensitivity_map is not None and method == "maskvd":
             sensi_map_downsized = cv2.resize(sensitivity_map, (input_img_size[0] // block_size, input_img_size[1] // block_size), interpolation=cv2.INTER_AREA)
             sensi_map_downsized = (sensi_map_downsized > 0.5).astype(np.float32)
             dmap_expanded = sensi_map_downsized + dmap.squeeze().cpu().numpy() * (1 - sensi_map_downsized)
-            dmap_recompute = torch.from_numpy(dmap_expanded).unsqueeze(0).unsqueeze(-1).to("cuda")
+            dmap_recompute = torch.from_numpy(dmap_expanded).unsqueeze(0).unsqueeze(-1).to("cuda:1")
         else:
             dmap_recompute = dmap
 
 
         ## INFERENCE ##
-        if method == "ours" or method == "stgt":
+        if method == "ours":
             (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_contexted(image_placed, cached_features_dict, dmap_recompute)
         elif method == "evit":
             (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_eventful(image_placed, cached_features_dict, dmap_recompute)
         elif method == "maskvd":
             (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_maskvd(image_placed, cached_features_dict, dmap_recompute)
-
+        elif method == "stgt":
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_stgt(image_placed, cached_features_dict, dmap_recompute)
         
         ## POSTPROCESS ##
         # > Create sensitivity map
@@ -426,7 +440,7 @@ def parse_str_list(value):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate a model on a dataset.")
     parser.add_argument("--model", type=str, default="vitdet-b", help="Model to use for evaluation.",
-        choices=["vitdet-b", "vitdet-l", "vitdet-h", "dino-swin4", "lwdetr", "swin-b", "swin-l"],
+        choices=["vitdet-b", "vitdet-l", "vitdet-h", "dino-swin4", "lwdetr", "swin-b", "swin-l", "mvit-b"],
     )
     parser.add_argument("--dataset", type=str, default="DAVIS2017_trainval", help="Dataset to evaluate on.",
         choices=["DAVIS2017_trainval", "DAVIS2019_challenge", "DAVIS2019_testdev"],
@@ -435,16 +449,18 @@ if __name__ == "__main__":
                        help="Frame rate(s) for evaluation. Comma-separated integers (e.g., 1,6,100).")
     parser.add_argument("--sequence", type=parse_str_list, default=None, 
                        help="Specific sequence(s) to evaluate on. Comma-separated strings (e.g., bear,camel). If None, evaluates on all sequences.")
-    parser.add_argument("--dmap_type", type=str, choices=["threshold", "topk"], default="threshold",
+    parser.add_argument("--dmap-type", type=str, choices=["threshold", "topk"], default="threshold",
                        help="Type of dirtiness map to use. 'threshold' for thresholding, 'topk' for top-k dirtiness.")
-    parser.add_argument("--dirty_thres", type=int, default=30, nargs="?",
+    parser.add_argument("--dirty-thres", type=int, default=30, nargs="?",
                        help="Dirtiness threshold for the dirtiness map. Default is 30.")
-    parser.add_argument("--dirty_topk", type=int, default=100, nargs="?",
+    parser.add_argument("--dirty-topk", type=int, default=100, nargs="?",
                        help="Top-k dirtiness for the dirtiness map. Default is 100.")
     parser.add_argument("--method", type=str, choices=["ours", "evit", "maskvd", "stgt"], default="ours",
                        help="Method to use for evaluation. 'ours' for IPConv, 'evit' for Eventful ViT.")
-    parser.add_argument("--device", type=str, default="cuda:0", help="Device to run the evaluation on.")
+    parser.add_argument("--device", type=str, default="cuda:1", help="Device to run the evaluation on.")
     args = parser.parse_args()
+
+    print(args)
 
     main(args)
 

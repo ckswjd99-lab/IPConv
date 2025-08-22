@@ -21,10 +21,12 @@ from evaluate_funcs import (
     estimate_affine,
     refresh_placing_matrix,
     shift_anchor_features,
+    shift_anchor_features_swin,
     refresh_placing_matrix,
     create_dirtiness_map,
     create_sensitivity_map,
-    expand_mask_neighbors
+    expand_mask_neighbors,
+    objdet_coco_to_imvid
 )
 from ipconv.models.ViTDet.modeling.backbone.utils import get_abs_pos
 
@@ -66,7 +68,8 @@ def evaluate_sequence(
         heatmap = np.repeat(heatmap[:, :, np.newaxis], 3, axis=2)
 
     
-    pbar = tqdm(enumerate(sequence_data), leave=False, total=len(sequence_data), desc=f"Evaluating {sequence_name} at {frame_rate} fps")
+    # pbar = tqdm(enumerate(sequence_data), leave=False, total=len(sequence_data), desc=f"Evaluating {sequence_name} at {frame_rate} fps")
+    pbar = enumerate(sequence_data)
     img_sample = sequence_data[0][0]
     img_H, img_W = img_sample.shape[1:]
     input_img_size = (1024, 1024)
@@ -80,11 +83,23 @@ def evaluate_sequence(
         [0.0, 0.0, 1.0]
     ], dtype=np.float32)
 
-    ape = get_abs_pos(
-        model.backbone.net.pos_embed,
-        model.backbone.net.pretrain_use_cls_token,
-        (input_img_size[0] // block_size, input_img_size[1] // block_size)
-    )
+    if "Swin" in model.__class__.__name__:
+        ape = None
+    elif "MViT" in model.__class__.__name__:
+        # print(model.base_model.backbone.bottom_up.pos_embed)
+        # print(model.base_model.backbone.bottom_up.pretrain_use_cls_token)
+        # ape = get_abs_pos(
+        #     model.base_model.backbone.bottom_up.pos_embed,
+        #     model.base_model.backbone.bottom_up.pretrain_use_cls_token,
+        #     (input_img_size[0] // block_size, input_img_size[1] // block_size)
+        # )
+        ape = None
+    else:
+        ape = get_abs_pos(
+            model.backbone.net.pos_embed,
+            model.backbone.net.pretrain_use_cls_token,
+            (input_img_size[0] // block_size, input_img_size[1] // block_size)
+        )
 
     # variables
     frames_until_refresh = 0
@@ -142,6 +157,7 @@ def evaluate_sequence(
         
         if method != "ours":
             placing_matrix = centering_matrix.copy()
+            shift_x, shift_y = 0, 0
 
         # > Place the image in the input
         image_placed = np.zeros((input_img_size[1], input_img_size[0], 3), dtype=np.uint8)
@@ -157,9 +173,16 @@ def evaluate_sequence(
 
         # > Shift cached features and reference frame
         if shift_x != 0 or shift_y != 0:
-            cached_features_dict = shift_anchor_features(
-                cached_features_dict, shift_x, shift_y, ape
-            )
+            if "Swin" in model.__class__.__name__:
+                cached_features_dict = shift_anchor_features_swin(
+                    cached_features_dict, shift_x * (block_size // 4), shift_y * (block_size // 4)
+                )
+            elif "MViT" in model.__class__.__name__:
+                pass
+            else:
+                cached_features_dict = shift_anchor_features(
+                    cached_features_dict, shift_x, shift_y, ape
+                )
             if ref_frame_aligned is not None:
                 ref_frame_aligned = np.roll(ref_frame_aligned, shift=(-shift_y * block_size, -shift_x * block_size), axis=(0, 1))
             if sensitivity_map is not None:
@@ -223,9 +246,11 @@ def evaluate_sequence(
 
         ## INFERENCE ##
         if method == "ours" or method == "stgt":
-            (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_contexted(image_placed, cached_features_dict, dmap_recompute)
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict, _ = model.forward_contexted(image_placed, cached_features_dict, dmap_recompute)
         elif method == "evit" or method == "maskvd":
-            (boxes_cont, labels_cont, scores_cont), cached_features_dict = model.forward_eventful(image_placed, cached_features_dict, dmap_recompute)
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict, _ = model.forward_eventful(image_placed, cached_features_dict, dmap_recompute)
+
+        boxes_cont, labels_cont, scores_cont = objdet_coco_to_imvid(boxes_cont, labels_cont, scores_cont)
 
         recompute_rate.append(dmap_recompute.mean().item())
 
@@ -263,7 +288,7 @@ def evaluate_sequence(
         cv2.imwrite(f"temp/{sequence_name}_{idx:04d}.jpg", vis_image[:, :, ::-1])
 
         #print(f"Processed frame {idx} of sequence {sequence_name}, boxes: {len(boxes_cont)}")
-        '''
+        # '''
         ref_frame = image.copy()
         ref_frame_aligned = image_placed.copy()
         frames_until_refresh -= 1
@@ -330,10 +355,13 @@ def evaluate(
     model.clear_counts()
     sequence_name = 0
     n_frames = 0
-    for sequence_data in dataset:
+
+    pbar = tqdm(dataset, desc="Evaluating sequences", total=len(dataset))
+    for sequence_data in pbar:
+        # print(f"Evaluating sequence {sequence_name}/{len(dataset)} with {len(sequence_data)} frames")
         for frame_rate in frame_rates:
             # try:
-            print(f"Evaluating sequence: {sequence_name}, frame rate: {frame_rate} fps")
+            # print(f"Evaluating sequence: {sequence_name}, frame rate: {frame_rate} fps")
 
             evaluate_sequence(model, sequence_name, sequence_data, frame_rate, method, dmap_type, dirty_thres, dirty_topk, sensi_expansion, **kwargs)
             model.reset()
@@ -344,6 +372,9 @@ def evaluate(
             #     break
 
         sequence_name += 1
+
+        if sequence_name == 1:
+            break
 
     mean_ap = MeanAveragePrecision(box_format='xyxy')
     mean_ap.update(outputs, labels)
@@ -362,13 +393,13 @@ def main(args):
 
     def save_csv_results(results, output_dir, first_run=False):
         for key, val in results.items():
-            with open(output_dir / f"{key}.csv", "a") as csv_file:
+            with open(output_dir / f"{key}.csv", "w") as csv_file:
                 if first_run:
                     print(dict_csv_header(val), file=csv_file)
                 print(dict_csv_line(val), file=csv_file)
 
     def do_evaluation(title, results):
-        with open(output_dir / "output.txt", "a") as tee_file:
+        with open(output_dir / "output.txt", "w") as tee_file:
             tee_print(title, tee_file)
             if isinstance(results, dict):
                 save_csv_results(results, output_dir, first_run=(len(completed) == 0))
@@ -416,8 +447,8 @@ def parse_str_list(value):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate a model on a dataset.")
-    parser.add_argument("--model", type=str, default="vitdet-b-imnetvid", help="Model to use for evaluation.",
-        choices=["vitdet-b-imnetvid"],
+    parser.add_argument("--model", type=str, default="vitdet-b", help="Model to use for evaluation.",
+        choices=["vitdet-b", "vitdet-l", "vitdet-h", "dino-swin4", "lwdetr", "swin-b", "swin-l", "mvit-b"],
     )
     parser.add_argument("--dataset", type=str, default="imnet-vid", help="Dataset to evaluate on.",
         choices=["davis", "imnet-vid"],
