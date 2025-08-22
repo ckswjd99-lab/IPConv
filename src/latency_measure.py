@@ -89,15 +89,15 @@ def main():
 
     # methods = ["ours", "eventful", "maskvd", "stgt"]
     # methods = ["vanilla"]
-    methods = ["ours"]
+    methods = ["ours", "eventful", "maskvd"]
 
     input_sizes = [1024]
 
-    for mname, model_class in models_dict.items():
-        model = model_class("cuda")
-        model.eval()
+    for input_size in input_sizes:
+        for mname, model_class in models_dict.items():
+            model = model_class("cuda")
+            model.eval()
 
-        for input_size in input_sizes:
             for method in methods:
                 for keep_rate in keep_rates:
                     latency, cache_size = measure_latency_memory(model, keep_rate, method, input_size)
