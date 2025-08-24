@@ -46,7 +46,7 @@ from ..proc_image import (
 fidx = 0
 
 class ViTDeT_b_Imagenet_Contexted(ExtendedModule):
-    def __init__(self, device="cuda:1"):
+    def __init__(self, device="cuda:0"):
         super().__init__()
         self.idx = 0
 
@@ -248,7 +248,7 @@ class ViTDeT_b_Imagenet_Contexted(ExtendedModule):
             self, 
             image_ndarray: np.ndarray, 
             anchor_features: Dict[str, torch.Tensor] = {},
-            dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda:1"),
+            dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda:0"),
             only_backbone: bool = False,
     ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], Dict[str, torch.Tensor]]:
         # image_ndarray: (H, W, C)
@@ -488,7 +488,7 @@ class ViTDeT_b_Imagenet_Contexted(ExtendedModule):
 
         return (boxes, labels, scores), new_cache_feature
 
-def reset_head(base_model, num_classes=30, device="cuda:1"):
+def reset_head(base_model, num_classes=30, device="cuda:0"):
     """
     base_model: GeneralizedRCNN 인스턴스
     num_classes: 새로운 클래스 개수
