@@ -62,8 +62,18 @@ def evaluate_sequence(
             return torch.empty(*safe_shape, dtype=dtype)
 
     if method == "maskvd":
+        img_max_size = int(1024 * 0.8) // 2 * 2
+
         maskvd_heatmap = np.load("maskvd_heatmap.npy")
         maskvd_heatmap = (maskvd_heatmap - maskvd_heatmap.min()) / (maskvd_heatmap.max() - maskvd_heatmap.min())
+
+        maskvd_heatmap = cv2.resize(
+            maskvd_heatmap,
+            dsize=None,
+            fx=img_max_size / max(maskvd_heatmap.shape[:2]),
+            fy=img_max_size / max(maskvd_heatmap.shape[:2]),
+            interpolation=cv2.INTER_LINEAR
+        )
 
         hmap_H, hmap_W = maskvd_heatmap.shape[:2]
         heatmap = np.zeros((1024, 1024), dtype=np.float32)
