@@ -645,9 +645,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
                 x_attn_flat = x_attn.reshape(-1, x_attn.shape[-1])
                 x_attn_selected = x_attn_flat
                 x_attn_selected = block.attn.proj(x_attn_selected)
-                x_attn = torch.zeros(B_attn * H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=x_attn.dtype)
-                x_attn = x_attn_selected.view(-1, x_attn_selected.shape[-1])
-                x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
+                x_attn = x_attn_selected.view(B_attn, H_attn, W_attn, -1)
 
             else:   # global attention
                 q_selected = q[:, selected_indices, :]
@@ -819,11 +817,10 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             if fname in anchor_features:
                 dmap_channeled = dmap_now.reshape(B_attn, H_attn * W_attn)
                 dmap_broadcastable = dmap_channeled.unsqueeze(0).unsqueeze(2).unsqueeze(-1)
-                kv_cached = anchor_features[fname]
-                qkv_cached = torch.zeros_like(qkv)
-                qkv_cached[1:] = self.add(qkv[1:] * dmap_broadcastable, kv_cached * (1 - dmap_broadcastable))
+                qkv_cached = anchor_features[fname]
+                qkv_cached = self.add(qkv * dmap_broadcastable, qkv_cached * (1 - dmap_broadcastable))
                 qkv = qkv_cached
-            new_cache_feature[fname] = qkv.clone()[1:]
+            new_cache_feature[fname] = qkv.clone()
 
             q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)  # q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
 
