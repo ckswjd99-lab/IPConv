@@ -33,6 +33,7 @@ from ipconv.models.ViTDet.modeling.backbone.utils import get_abs_pos
 outputs = []
 labels = []
 recompute_rate = []
+global_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 def evaluate_sequence(
     model: nn.Module,
@@ -60,6 +61,8 @@ def evaluate_sequence(
 
     if method == "maskvd":
         maskvd_heatmap = np.load("maskvd_heatmap.npy")
+        maskvd_heatmap = (maskvd_heatmap - maskvd_heatmap.min()) / (maskvd_heatmap.max() - maskvd_heatmap.min())
+
         hmap_H, hmap_W = maskvd_heatmap.shape[:2]
         heatmap = np.zeros((1024, 1024), dtype=np.float32)
         # place at center
@@ -210,50 +213,57 @@ def evaluate_sequence(
                 )
 
             if isinstance(dmap_raw, np.ndarray):
-                dmap = torch.from_numpy(dmap_raw).to("cuda:1")
+                dmap = torch.from_numpy(dmap_raw).to(global_device)
             elif isinstance(dmap_raw, torch.Tensor):
-                dmap = dmap_raw.to("cuda:1")
+                dmap = dmap_raw.to(global_device)
             else:
                 raise TypeError("Unsupported type for dirtiness map")
         else:
-            dmap = torch.ones(1, 64, 64, 1, device="cuda:1")
+            dmap = torch.ones(1, 64, 64, 1, device=global_device)
 
-        
         dmap_ndarray = dmap.squeeze().cpu().numpy()
         dmap_ndarray = cv2.resize(dmap_ndarray, (input_img_size[0], input_img_size[1]), interpolation=cv2.INTER_NEAREST)
         dmap_ndarray = np.repeat(dmap_ndarray[:, :, np.newaxis], 3, axis=2)
 
         # > Update the placed image with the dirtiness map
-        if ref_frame_aligned is not None:
-            image_placed = image_placed * dmap_ndarray + ref_frame_aligned * (1 - dmap_ndarray)
-            image_placed = np.clip(image_placed, 0, 255).astype(np.uint8)
+        # if ref_frame_aligned is not None:
+        #     image_placed = image_placed * dmap_ndarray + ref_frame_aligned * (1 - dmap_ndarray)
+        #     image_placed = np.clip(image_placed, 0, 255).astype(np.uint8)
 
         # > Expand the sensitive area
         if sensitivity_map is not None and method == "ours":
-            dmap_expanded = expand_mask_neighbors(dmap, sensi_expansion).cpu().numpy().squeeze(0).squeeze(-1)
+            dmap_expanded = expand_mask_neighbors(dmap).cpu().numpy().squeeze(0).squeeze(-1)
             sensi_map_downsized = cv2.resize(sensitivity_map, (input_img_size[0] // block_size, input_img_size[1] // block_size), interpolation=cv2.INTER_AREA)
-            sensi_map_downsized = (sensi_map_downsized > 0.5).astype(np.float32)
+            sensi_map_downsized = (sensi_map_downsized > 0.0).astype(np.float32)
             dmap_expanded = dmap_expanded * sensi_map_downsized + dmap.squeeze().cpu().numpy() * (1 - sensi_map_downsized)
-            dmap_recompute = torch.from_numpy(dmap_expanded).unsqueeze(0).unsqueeze(-1).to("cuda:1")
+            dmap_recompute = torch.from_numpy(dmap_expanded).unsqueeze(0).unsqueeze(-1).to(global_device)
         elif sensitivity_map is not None and method == "maskvd":
             sensi_map_downsized = cv2.resize(sensitivity_map, (input_img_size[0] // block_size, input_img_size[1] // block_size), interpolation=cv2.INTER_AREA)
-            sensi_map_downsized = (sensi_map_downsized > 0.5).astype(np.float32)
+            sensi_map_downsized = (sensi_map_downsized > 0.0).astype(np.float32)
             dmap_expanded = sensi_map_downsized + dmap.squeeze().cpu().numpy() * (1 - sensi_map_downsized)
-            dmap_recompute = torch.from_numpy(dmap_expanded).unsqueeze(0).unsqueeze(-1).to("cuda:1")
+            dmap_recompute = torch.from_numpy(dmap_expanded).unsqueeze(0).unsqueeze(-1).to(global_device)
         else:
+            dmap_expanded = dmap.squeeze().cpu().numpy()
             dmap_recompute = dmap
+        
+        # > Update the placed image with the dirtiness map
+        if ref_frame_aligned is not None:
+            dmap_expanded = cv2.resize(dmap_expanded, (input_img_size[0], input_img_size[1]), interpolation=cv2.INTER_NEAREST)
+            image_placed = image_placed * dmap_expanded[:, :, None] + ref_frame_aligned * (1 - dmap_expanded[:, :, None])
+            image_placed = np.clip(image_placed, 0, 255).astype(np.uint8)
 
 
         ## INFERENCE ##
-        if method == "ours" or method == "stgt":
-            (boxes_cont, labels_cont, scores_cont), cached_features_dict, _ = model.forward_contexted(image_placed, cached_features_dict, dmap_recompute)
-        elif method == "evit" or method == "maskvd":
-            (boxes_cont, labels_cont, scores_cont), cached_features_dict, _ = model.forward_eventful(image_placed, cached_features_dict, dmap_recompute)
-
+        if method == "ours":
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_contexted(image_placed, cached_features_dict, dmap_recompute)
+        elif method == "evit":
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_eventful(image_placed, cached_features_dict, dmap_recompute)
+        elif method == "maskvd":
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_maskvd(image_placed, cached_features_dict, dmap_recompute)
+        elif method == "stgt":
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_stgt(image_placed, cached_features_dict, dmap_recompute)
+        
         boxes_cont, labels_cont, scores_cont = objdet_coco_to_imvid(boxes_cont, labels_cont, scores_cont)
-
-        recompute_rate.append(dmap_recompute.mean().item())
-
         
         ## POSTPROCESS ##
         # > Create sensitivity map
@@ -331,6 +341,7 @@ def evaluate_sequence(
         gt_boxes = annotations["boxes"].reshape(-1, 4)
         gt_labels = annotations["labels"].reshape(-1)
         labels.append({"boxes": gt_boxes, "labels": gt_labels})
+        recompute_rate.append(dmap_recompute.sum().item() / dmap_recompute.numel())
 
     #os.system(f"ffmpeg -framerate {frame_rate} -i temp/{sequence_name}_%04d.jpg -c:v libx264 -pix_fmt yuv420p temp/{sequence_name}_{frame_rate}fps.mp4 -y")
 
@@ -372,9 +383,6 @@ def evaluate(
             #     break
 
         sequence_name += 1
-
-        if sequence_name == 1:
-            break
 
     mean_ap = MeanAveragePrecision(box_format='xyxy')
     mean_ap.update(outputs, labels)
@@ -453,15 +461,15 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="imnet-vid", help="Dataset to evaluate on.",
         choices=["davis", "imnet-vid"],
     )
-    parser.add_argument("--frame-rates", type=parse_int_list, default=[100], 
+    parser.add_argument("--frame-rates", type=parse_int_list, default=[30], 
                        help="Frame rate(s) for evaluation. Comma-separated integers (e.g., 1,6,100).")
-    parser.add_argument("--sequence", type=parse_str_list, default=["bear"], 
+    parser.add_argument("--sequence", type=parse_str_list, default=None, 
                        help="Specific sequence(s) to evaluate on. Comma-separated strings (e.g., bear,camel). If None, evaluates on all sequences.")
-    parser.add_argument("--dmap_type", type=str, choices=["threshold", "topk"], default="threshold",
+    parser.add_argument("--dmap-type", type=str, choices=["threshold", "topk"], default="topk",
                        help="Type of dirtiness map to use. 'threshold' for thresholding, 'topk' for top-k dirtiness.")
-    parser.add_argument("--dirty_thres", type=int, default=30, nargs="?",
+    parser.add_argument("--dirty-thres", type=int, default=30, nargs="?",
                        help="Dirtiness threshold for the dirtiness map. Default is 30.")
-    parser.add_argument("--dirty-topk", type=int, default=100, nargs="?",
+    parser.add_argument("--dirty-topk", type=int, default=128, nargs="?",
                        help="Top-k dirtiness for the dirtiness map. Default is 100.")
     parser.add_argument("--sensi-expansion", type=int, default=1,
                        help="Expansion factor for the sensitivity map. Default is 1.")
@@ -469,6 +477,10 @@ if __name__ == "__main__":
                        help="Method to use for evaluation. 'ours' for IPConv, 'evit' for Eventful ViT.")
     parser.add_argument("--device", type=str, default="cuda:1",)
     args = parser.parse_args()
+
+    print(args)
+
+    global_device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     main(args)
 
