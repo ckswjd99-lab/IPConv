@@ -287,6 +287,14 @@ def evaluate_sequence(
         dmap_recompute = cv2.resize(dmap_recompute, (input_img_size[0], input_img_size[1]), interpolation=cv2.INTER_NEAREST)
         vis_image[:, :, 1] = np.clip(vis_image[:, :, 1] + dmap_recompute * 30, 0, 255)
 
+        score_thres = 0.5
+        # > Filter boxes by score threshold
+        result_mask = scores_cont >= score_thres
+        boxes_cont = boxes_cont[result_mask]
+        labels_cont = labels_cont[result_mask]
+        scores_cont = scores_cont[result_mask]
+        pred_masks = pred_masks[result_mask]
+
         # > Draw boxes and labels on the placed image
         for box, label, score in zip(boxes_cont, labels_cont, scores_cont):
             if score < 0.5:
@@ -300,8 +308,8 @@ def evaluate_sequence(
         vis_image = np.roll(vis_image, shift=(cum_shift_y * block_size, cum_shift_x * block_size), axis=(0, 1))
         
         if ref_frame_aligned is not None:
-            cv2.imwrite(f"temp/{sequence_name}_{idx:04d}_ref.jpg", ref_frame_aligned[:, :, ::-1])
-        cv2.imwrite(f"temp/{sequence_name}_{idx:04d}.jpg", vis_image[:, :, ::-1])
+            cv2.imwrite(f"temp/{method}_{frame_rate}fps/{sequence_name}/{idx:04d}_ref.jpg", ref_frame_aligned[:, :, ::-1])
+        cv2.imwrite(f"temp/{method}_{frame_rate}fps/{sequence_name}/{idx:04d}.jpg", vis_image[:, :, ::-1])
 
         #print(f"Processed frame {idx} of sequence {sequence_name}, boxes: {len(boxes_cont)}")
         # '''
@@ -404,7 +412,7 @@ def evaluate(
         
         # break
 
-        pbar.set_description(f"meanJ{sum(J_list) / len(J_list):.4f}, meanF{sum(F_list) / len(F_list):.4f}")
+        pbar.set_description(f"meanJ {sum(J_list) / len(J_list):.4f}, meanF {sum(F_list) / len(F_list):.4f}")
     
     counts = model.total_counts() / n_frames
     model.clear_counts()
