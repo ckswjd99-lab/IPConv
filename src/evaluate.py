@@ -39,6 +39,8 @@ J_list = []
 F_list = []
 recomp_rate_list = []
 
+global_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
 def evaluate_sequence(
     model: nn.Module,
     sequence_name: str,
@@ -71,7 +73,8 @@ def evaluate_sequence(
         heatmap = np.repeat(heatmap[:, :, np.newaxis], 3, axis=2)
 
     
-    pbar = tqdm(enumerate(sequence_data), leave=False)
+    # pbar = tqdm(enumerate(sequence_data), leave=False)
+    pbar = enumerate(sequence_data)
     img_sample = sequence_data[0][0]
     img_H, img_W = img_sample.shape[:2]
     input_img_size = (1024, 1024)
@@ -203,41 +206,49 @@ def evaluate_sequence(
                     block_size=block_size,
                     dmap_type=args.dmap_type,
                     dirty_thres=args.dirty_thres,
-                    dirty_topk=args.dirty_topk
+                    dirty_topk=args.dirty_topk,
+                    chromakey = np.array([0, 0, 0], dtype=np.uint8)  # black chromakey
                 )
 
             if isinstance(dmap_raw, np.ndarray):
-                dmap = torch.from_numpy(dmap_raw).to("cuda:1")
+                dmap = torch.from_numpy(dmap_raw).to(global_device)
             elif isinstance(dmap_raw, torch.Tensor):
-                dmap = dmap_raw.to("cuda:1")
+                dmap = dmap_raw.to(global_device)
             else:
                 raise TypeError("Unsupported type for dirtiness map")
         else:
-            dmap = torch.ones(1, 64, 64, 1, device="cuda:1")
+            dmap = torch.ones(1, 64, 64, 1, device=global_device)
 
         dmap_ndarray = dmap.squeeze().cpu().numpy()
         dmap_ndarray = cv2.resize(dmap_ndarray, (input_img_size[0], input_img_size[1]), interpolation=cv2.INTER_NEAREST)
         dmap_ndarray = np.repeat(dmap_ndarray[:, :, np.newaxis], 3, axis=2)
 
         # > Update the placed image with the dirtiness map
-        if ref_frame_aligned is not None:
-            image_placed = image_placed * dmap_ndarray + ref_frame_aligned * (1 - dmap_ndarray)
-            image_placed = np.clip(image_placed, 0, 255).astype(np.uint8)
+        # if ref_frame_aligned is not None:
+        #     image_placed = image_placed * dmap_ndarray + ref_frame_aligned * (1 - dmap_ndarray)
+        #     image_placed = np.clip(image_placed, 0, 255).astype(np.uint8)
 
         # > Expand the sensitive area
         if sensitivity_map is not None and method == "ours":
             dmap_expanded = expand_mask_neighbors(dmap).cpu().numpy().squeeze(0).squeeze(-1)
             sensi_map_downsized = cv2.resize(sensitivity_map, (input_img_size[0] // block_size, input_img_size[1] // block_size), interpolation=cv2.INTER_AREA)
-            sensi_map_downsized = (sensi_map_downsized > 0.5).astype(np.float32)
+            sensi_map_downsized = (sensi_map_downsized > 0.0).astype(np.float32)
             dmap_expanded = dmap_expanded * sensi_map_downsized + dmap.squeeze().cpu().numpy() * (1 - sensi_map_downsized)
-            dmap_recompute = torch.from_numpy(dmap_expanded).unsqueeze(0).unsqueeze(-1).to("cuda:1")
+            dmap_recompute = torch.from_numpy(dmap_expanded).unsqueeze(0).unsqueeze(-1).to(global_device)
         elif sensitivity_map is not None and method == "maskvd":
             sensi_map_downsized = cv2.resize(sensitivity_map, (input_img_size[0] // block_size, input_img_size[1] // block_size), interpolation=cv2.INTER_AREA)
-            sensi_map_downsized = (sensi_map_downsized > 0.5).astype(np.float32)
+            sensi_map_downsized = (sensi_map_downsized > 0.0).astype(np.float32)
             dmap_expanded = sensi_map_downsized + dmap.squeeze().cpu().numpy() * (1 - sensi_map_downsized)
-            dmap_recompute = torch.from_numpy(dmap_expanded).unsqueeze(0).unsqueeze(-1).to("cuda:1")
+            dmap_recompute = torch.from_numpy(dmap_expanded).unsqueeze(0).unsqueeze(-1).to(global_device)
         else:
+            dmap_expanded = dmap.squeeze().cpu().numpy()
             dmap_recompute = dmap
+        
+        # > Update the placed image with the dirtiness map
+        if ref_frame_aligned is not None:
+            dmap_expanded = cv2.resize(dmap_expanded, (input_img_size[0], input_img_size[1]), interpolation=cv2.INTER_NEAREST)
+            image_placed = image_placed * dmap_expanded[:, :, None] + ref_frame_aligned * (1 - dmap_expanded[:, :, None])
+            image_placed = np.clip(image_placed, 0, 255).astype(np.uint8)
 
 
         ## INFERENCE ##
@@ -255,7 +266,7 @@ def evaluate_sequence(
         if method in ["ours", "maskvd"]:
             sensitivity_map = create_sensitivity_map(boxes_cont, scores_cont, input_img_size)
         
-        '''
+        # '''
         ## VISUALIZE ##
         # > Draw the full border
         vis_image = image_placed.copy()
@@ -283,7 +294,7 @@ def evaluate_sequence(
         cv2.imwrite(f"temp/{sequence_name}_{idx:04d}.jpg", vis_image[:, :, ::-1])
 
         #print(f"Processed frame {idx} of sequence {sequence_name}, boxes: {len(boxes_cont)}")
-        '''
+        # '''
         ref_frame = image.copy()
         ref_frame_aligned = image_placed.copy()
         frames_until_refresh -= 1
@@ -313,7 +324,8 @@ def evaluate_sequence(
                     borderValue=0
                 )
 
-                composite_mask[warped_mask > 127] = i + 1
+                # composite_mask[warped_mask > 127] = i + 1
+                composite_mask[warped_mask > 127] = 255
 
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             imageio.imwrite(save_path, composite_mask)
@@ -369,15 +381,20 @@ def evaluate(
     model.clear_counts()
     n_frames = 0
 
-    for sequence_name, sequence_data in dataset.items():
+    pbar = tqdm(dataset.items(), total=len(dataset))
+    for sequence_name, sequence_data in pbar:
         if sequence_name == "name": continue
 
         dataset_name = "davis2017_trainval"  # Default dataset name, can be changed based on the dataset structure
         for frame_rate in frame_rates:
-            print(f"Evaluating sequence: {sequence_name}, frame rate: {frame_rate} fps")
+            # print(f"Evaluating sequence: {sequence_name}, frame rate: {frame_rate} fps")
             evaluate_sequence(model, sequence_name, sequence_data, frame_rate, method, dataset_name=dataset_name, **kwargs)
             model.reset()
             n_frames += len(sequence_data)
+        
+        # break
+
+        pbar.set_description(f"meanJ{sum(J_list) / len(J_list):.4f}, meanF{sum(F_list) / len(F_list):.4f}")
     
     counts = model.total_counts() / n_frames
     model.clear_counts()
@@ -445,7 +462,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="DAVIS2017_trainval", help="Dataset to evaluate on.",
         choices=["DAVIS2017_trainval", "DAVIS2019_challenge", "DAVIS2019_testdev"],
     )
-    parser.add_argument("--frame-rates", type=parse_int_list, default=[100], 
+    parser.add_argument("--frame-rates", type=parse_int_list, default=[30], 
                        help="Frame rate(s) for evaluation. Comma-separated integers (e.g., 1,6,100).")
     parser.add_argument("--sequence", type=parse_str_list, default=None, 
                        help="Specific sequence(s) to evaluate on. Comma-separated strings (e.g., bear,camel). If None, evaluates on all sequences.")
@@ -457,10 +474,15 @@ if __name__ == "__main__":
                        help="Top-k dirtiness for the dirtiness map. Default is 100.")
     parser.add_argument("--method", type=str, choices=["ours", "evit", "maskvd", "stgt"], default="ours",
                        help="Method to use for evaluation. 'ours' for IPConv, 'evit' for Eventful ViT.")
-    parser.add_argument("--device", type=str, default="cuda:1", help="Device to run the evaluation on.")
+    parser.add_argument("--device", type=str, default="cuda:0", help="Device to run the evaluation on.")
     args = parser.parse_args()
 
     print(args)
+    global_device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    if global_device == "cpu":
+        print("Warning: Running on CPU, this may be slow for large models or datasets.")
+        exit(1)
 
     main(args)
 

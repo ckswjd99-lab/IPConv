@@ -643,10 +643,10 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
                 x_attn = self.matmul(attn, v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
 
                 x_attn_flat = x_attn.reshape(-1, x_attn.shape[-1])
-                x_attn_selected = F.embedding(selected_indices, x_attn_flat)
+                x_attn_selected = x_attn_flat
                 x_attn_selected = block.attn.proj(x_attn_selected)
                 x_attn = torch.zeros(B_attn * H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=x_attn.dtype)
-                x_attn[selected_indices, :] = x_attn_selected.view(-1, x_attn_selected.shape[-1])
+                x_attn = x_attn_selected.view(-1, x_attn_selected.shape[-1])
                 x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
 
             else:   # global attention
@@ -864,8 +864,8 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
 
             fname = f"block{bidx}_attn_proj"
             if fname in anchor_features:
-                dmap_channeled = dmap_now.reshape(B_attn, H_attn * W_attn)
-                dmap_broadcastable = dmap_channeled.unsqueeze(0).unsqueeze(2).unsqueeze(-1)
+                dmap_hw = dmap_channeled.reshape(B_attn, H_attn, W_attn)
+                dmap_broadcastable = dmap_hw.unsqueeze(-1)
                 x_attn = self.add(x_attn * dmap_broadcastable, anchor_features[fname] * (1 - dmap_broadcastable))
             new_cache_feature[fname] = x_attn.clone()
 

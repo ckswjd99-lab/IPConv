@@ -440,14 +440,15 @@ def create_dirtiness_map(
     dmap_type: str = "threshold",
     dirty_thres: int = 30,
     dirty_topk: int = 100,
-    chromakey: np.ndarray = np.array([123.675, 116.28, 103.53], dtype=np.uint8),
+    chromakey: np.ndarray = None,
     sensi_map: np.ndarray = None,
 ) -> torch.Tensor:
     residual = cv2.absdiff(anchor_image, current_image)
     
     # inside current_image, if there is any pixel with chromakey color, set the residual as 0
-    # chromakey_mask = np.all(current_image == chromakey, axis=-1)
-    # residual[chromakey_mask] = 0
+    if chromakey is not None:
+        chromakey_mask = np.all(current_image == chromakey, axis=-1)
+        residual[chromakey_mask] = 0
 
     dirtiness_map = cv2.cvtColor(residual, cv2.COLOR_BGR2GRAY)
 
