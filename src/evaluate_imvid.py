@@ -436,9 +436,10 @@ def main(args):
     results = evaluate(model, dataset, args.frame_rates, args.method, args.dmap_type, args.dirty_thres, args.dirty_topk, args.sensi_expansion, **settings_dict)
 
     completed = []
+    model_name = f"{args.model}"
     frame_rate_str = f"{args.frame_rates[0]}fps"
     dirtiness_key = f"thres{args.dirty_thres}" if args.dmap_type == "threshold" else f"topk{args.dirty_topk}"
-    output_dir = Path("output") / frame_rate_str / dirtiness_key
+    output_dir = Path("output") / args.dataset / model_name / f"{args.method}_{frame_rate_str}" / dirtiness_key
     output_dir.mkdir(parents=True, exist_ok=True)
 
     do_evaluation("Vanilla", results)
@@ -475,7 +476,7 @@ if __name__ == "__main__":
                        help="Expansion factor for the sensitivity map. Default is 1.")
     parser.add_argument("--method", type=str, choices=["ours", "evit", "maskvd", "stgt"], default="ours",
                        help="Method to use for evaluation. 'ours' for IPConv, 'evit' for Eventful ViT.")
-    parser.add_argument("--device", type=str, default="cuda:1",)
+    parser.add_argument("--device", type=str, default="cuda:0",)
     args = parser.parse_args()
 
     print(args)
