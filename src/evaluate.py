@@ -271,6 +271,14 @@ def evaluate_sequence(
         elif method == "stgt":
             (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_stgt(image_placed, cached_features_dict, dmap_recompute)
         
+        score_thres = 0.5
+        # > Filter boxes by score threshold
+        result_mask = scores_cont >= score_thres
+        boxes_cont = boxes_cont[result_mask]
+        labels_cont = labels_cont[result_mask]
+        scores_cont = scores_cont[result_mask]
+        pred_masks = pred_masks[result_mask]
+        
         ## POSTPROCESS ##
         # > Create sensitivity map
         if method in ["ours", "maskvd"]:
@@ -287,13 +295,6 @@ def evaluate_sequence(
         dmap_recompute = cv2.resize(dmap_recompute, (input_img_size[0], input_img_size[1]), interpolation=cv2.INTER_NEAREST)
         vis_image[:, :, 1] = np.clip(vis_image[:, :, 1] + dmap_recompute * 30, 0, 255)
 
-        score_thres = 0.5
-        # > Filter boxes by score threshold
-        result_mask = scores_cont >= score_thres
-        boxes_cont = boxes_cont[result_mask]
-        labels_cont = labels_cont[result_mask]
-        scores_cont = scores_cont[result_mask]
-        pred_masks = pred_masks[result_mask]
 
         # > Draw boxes and labels on the placed image
         for box, label, score in zip(boxes_cont, labels_cont, scores_cont):
