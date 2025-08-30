@@ -834,30 +834,18 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
                 # projection
                 attn = attn.softmax(dim=-1)
                 x_attn = self.matmul(attn, v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
-
-                x_attn_flat = x_attn.reshape(-1, x_attn.shape[-1])
-                x_attn_selected = F.embedding(selected_indices, x_attn_flat)
-                x_attn_selected = block.attn.proj(x_attn_selected)
-                
-                x_attn = torch.zeros(B_attn * H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=x_attn.dtype)
-                x_attn[selected_indices, :] = x_attn_selected.view(-1, x_attn_selected.shape[-1])
-                x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
+                x_attn = block.attn.proj(x_attn)
 
             else:   # global attention
-                num_selected = selected_indices.shape[0]
                 attn = self.matmul((q * block.attn.scale), k.transpose(-2, -1))
 
                 if block.attn.use_rel_pos:
-                    attn = self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn), dmap_now)
+                    attn = self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn))
 
                 # projection
-                attn_selected = attn[:, selected_indices, :].softmax(dim=-1)
-                x_attn_selected = self.matmul(attn_selected, v).view(B_attn, block.attn.num_heads, num_selected, -1).permute(0, 2, 1, 3).reshape(B_attn, num_selected, -1)
-                x_attn_selected = block.attn.proj(x_attn_selected)
-
-                x_attn = torch.zeros(B_attn, H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=x_attn.dtype)
-                x_attn[:, selected_indices, :] = x_attn_selected
-                x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
+                attn = attn.softmax(dim=-1)
+                x_attn = self.matmul(attn, v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
+                x_attn = block.attn.proj(x_attn)
 
             fname = f"block{bidx}_attn_proj"
             if fname in anchor_features:
@@ -877,15 +865,9 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
 
             shortcut2 = x
             x_norm2 = block.norm2(x)
+            x_mlp_out = block.drop_path(block.mlp(x_norm2))
 
-            x_mlp_out = partial_mlp_inference(
-                x_norm2,           # (B, H, W, C)
-                dmap_block,        # (B, H, W, 1)
-                block.mlp, 
-                block.drop_path
-            )
             x = self.add(shortcut2, x_mlp_out)
-
 
             if block.use_residual_block:    # nothing
                 x = self.residual(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)

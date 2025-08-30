@@ -330,6 +330,13 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
         dirtiness_map: torch.Tensor = torch.ones(1, 256, 256, 1, device="cuda"),
         only_backbone: bool = False,
     ):
+        return self.forward_stgt(
+            image_ndarray=image_ndarray,
+            anchor_features=anchor_features,
+            dirtiness_map=dirtiness_map,
+            only_backbone=only_backbone
+        )
+
         new_cache_feature = {}
 
         # convert to tensor
