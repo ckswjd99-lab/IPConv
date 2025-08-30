@@ -41,6 +41,7 @@ def evaluate_sequence(
     sequence_data: List[Tuple[torch.Tensor, Dict[str, int]]],
     frame_rate: int,
     method: str,
+    args,
     dmap_type: str = "threshold",
     dirty_thres: int = 30,
     dirty_topk: int = 100,
@@ -72,6 +73,13 @@ def evaluate_sequence(
             fy=img_max_size / max(maskvd_heatmap.shape[:2]),
             interpolation=cv2.INTER_LINEAR
         )
+
+        hmap_H, hmap_W = maskvd_heatmap.shape[:2]
+        heatmap = np.zeros((1024, 1024), dtype=np.float32)
+        # place at center
+        heatmap[(1024 - hmap_H) // 2:(1024 + hmap_H) // 2, (1024 - hmap_W) // 2:(1024 + hmap_W) // 2] = maskvd_heatmap
+        # repeat to 3 channels
+        heatmap = np.repeat(heatmap[:, :, np.newaxis], 3, axis=2)
 
     
     # pbar = tqdm(enumerate(sequence_data), leave=False, total=len(sequence_data), desc=f"Evaluating {sequence_name} at {frame_rate} fps")
@@ -234,7 +242,7 @@ def evaluate_sequence(
         #     image_placed = np.clip(image_placed, 0, 255).astype(np.uint8)
 
         # > Expand the sensitive area
-        if sensitivity_map is not None and method == "ours":
+        if sensitivity_map is not None and method == "ours" and args.roi_expand > 0:
             dmap_expanded = expand_mask_neighbors(dmap).cpu().numpy().squeeze(0).squeeze(-1)
             sensi_map_downsized = cv2.resize(sensitivity_map, (input_img_size[0] // block_size, input_img_size[1] // block_size), interpolation=cv2.INTER_AREA)
             sensi_map_downsized = (sensi_map_downsized > 0.0).astype(np.float32)
@@ -355,6 +363,7 @@ def evaluate(
     dataset: Dict[str, List[Tuple[torch.Tensor, Dict[str, int]]]],
     frame_rates: List[int],
     method: str,
+    args,
     dmap_type: str = "threshold",
     dirty_thres: int = 30,
     dirty_topk: int = 100,
@@ -377,7 +386,7 @@ def evaluate(
             # try:
             # print(f"Evaluating sequence: {sequence_name}, frame rate: {frame_rate} fps")
 
-            evaluate_sequence(model, sequence_name, sequence_data, frame_rate, method, dmap_type, dirty_thres, dirty_topk, sensi_expansion, **kwargs)
+            evaluate_sequence(model, sequence_name, sequence_data, frame_rate, method, args, dmap_type, dirty_thres, dirty_topk, sensi_expansion, **kwargs)
             model.reset()
             n_frames += len(sequence_data)
 
@@ -436,7 +445,7 @@ def main(args):
 
     model, dataset, settings_dict = prepare_environment(args)
 
-    results = evaluate(model, dataset, args.frame_rates, args.method, args.dmap_type, args.dirty_thres, args.dirty_topk, args.sensi_expansion, **settings_dict)
+    results = evaluate(model, dataset, args.frame_rates, args.method, args, args.dmap_type, args.dirty_thres, args.dirty_topk, args.sensi_expansion, **settings_dict)
 
     completed = []
     model_name = f"{args.model}"
@@ -480,6 +489,8 @@ if __name__ == "__main__":
     parser.add_argument("--method", type=str, choices=["ours", "evit", "maskvd", "stgt"], default="ours",
                        help="Method to use for evaluation. 'ours' for IPConv, 'evit' for Eventful ViT.")
     parser.add_argument("--device", type=str, default="cuda:0",)
+    parser.add_argument("--roi-expand", type=int, default=1,
+                       help="ROI expansion factor. Default is 1.")
     args = parser.parse_args()
 
     print(args)

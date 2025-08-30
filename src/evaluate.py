@@ -48,6 +48,7 @@ def evaluate_sequence(
     frame_rate: int,
     method: str,
     dataset_name: str,
+    args,
     **kwargs: Any
 ):
     """
@@ -239,7 +240,7 @@ def evaluate_sequence(
         #     image_placed = np.clip(image_placed, 0, 255).astype(np.uint8)
 
         # > Expand the sensitive area
-        if sensitivity_map is not None and method == "ours":
+        if sensitivity_map is not None and method == "ours" and args.roi_expand > 0:
             dmap_expanded = expand_mask_neighbors(dmap).cpu().numpy().squeeze(0).squeeze(-1)
             sensi_map_downsized = cv2.resize(sensitivity_map, (input_img_size[0] // block_size, input_img_size[1] // block_size), interpolation=cv2.INTER_AREA)
             sensi_map_downsized = (sensi_map_downsized > 0.0).astype(np.float32)
@@ -390,6 +391,7 @@ def evaluate(
     dataset: Dict[str, List[Tuple[torch.Tensor, Dict[str, int]]]],
     frame_rates: List[int],
     method: str,
+    args,
     **kwargs: Any
 ):
     """
@@ -407,7 +409,7 @@ def evaluate(
         dataset_name = "davis2017_trainval"  # Default dataset name, can be changed based on the dataset structure
         for frame_rate in frame_rates:
             # print(f"Evaluating sequence: {sequence_name}, frame rate: {frame_rate} fps")
-            evaluate_sequence(model, sequence_name, sequence_data, frame_rate, method, dataset_name=dataset_name, **kwargs)
+            evaluate_sequence(model, sequence_name, sequence_data, frame_rate, method, args=args, dataset_name=dataset_name, **kwargs)
             model.reset()
             n_frames += len(sequence_data)
         
@@ -431,7 +433,7 @@ def main(args):
     model, dataset, settings_dict = prepare_environment(args)
     model.eval()
 
-    counts = evaluate(model, dataset, args.frame_rates, args.method, **settings_dict)
+    counts = evaluate(model, dataset, args.frame_rates, args.method, args=args, **settings_dict)
 
     model_name = f"{args.model}"
     frame_rate_str = f"{args.frame_rates[0]}fps"
@@ -494,6 +496,7 @@ if __name__ == "__main__":
     parser.add_argument("--method", type=str, choices=["ours", "evit", "maskvd", "stgt"], default="ours",
                        help="Method to use for evaluation. 'ours' for IPConv, 'evit' for Eventful ViT.")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to run the evaluation on.")
+    parser.add_argument("--roi-expand", type=int, default=1, help="ROI expand factor.")
     args = parser.parse_args()
 
     print(args)

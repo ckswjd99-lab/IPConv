@@ -971,11 +971,8 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
 
                 # q: Tensor(ATTN_B_, block.attn.num_heads, ATTN_N, ATTN_C // block.attn.num_heads)
                 q = q * block.attn.scale
-                q_sel = q[dindice_for_embeddings, :, :]
-                k_sel = k[dindice_for_embeddings, :, :]
-                v_sel = v[dindice_for_embeddings, :, :]
 
-                attn_sel = self.matmul(q_sel, k_sel.transpose(-2, -1))
+                attn = self.matmul(q, k.transpose(-2, -1))
 
                 relative_position_bias = block.attn.relative_position_bias_table[
                     block.attn.relative_position_index.view(-1)
@@ -985,10 +982,7 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
                 relative_position_bias = relative_position_bias.permute(
                     2, 0, 1
                 ).contiguous()  # nH, Wh*Ww, Wh*Ww
-                attn_sel = self.add(attn_sel, relative_position_bias.unsqueeze(0))
-
-                attn = torch.zeros(ATTN_B_, block.attn.num_heads, ATTN_N, ATTN_N, device=x.device)
-                attn[dindice_for_embeddings, :, :] = attn_sel
+                attn = self.add(attn, relative_position_bias.unsqueeze(0))
 
                 if attn_mask is not None:
                     nW = attn_mask.shape[0]
@@ -1000,16 +994,15 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
 
                 attn = block.attn.attn_drop(attn)
 
-                attn_sel = attn[dindice_for_embeddings, :, :]
-
-                x_windows_sel = self.matmul(attn_sel, v_sel).transpose(1, 2).reshape(num_sel_windows, ATTN_N, ATTN_C)
+                x_windows = self.matmul(attn, v).transpose(1, 2).reshape(ATTN_B_, ATTN_N, ATTN_C)
+                x_windows_sel = x_windows[dindice_for_embeddings, :]
                 x_windows_sel = block.attn.proj(x_windows_sel)
                 x_windows_sel = block.attn.proj_drop(x_windows_sel)
 
                 fname = f"layer{lidx}_block{bidx}_attn_proj"
                 if fname in anchor_features:
                     x_windows = anchor_features[fname].clone()
-                    x_windows[dindice_for_embeddings, :] = qkv_sel
+                    x_windows[dindice_for_embeddings, :] = x_windows_sel
                 else:
                     x_windows = torch.zeros(ATTN_B_, ATTN_N, ATTN_C, device=x.device)
                     x_windows[dindice_for_embeddings, :] = x_windows_sel
