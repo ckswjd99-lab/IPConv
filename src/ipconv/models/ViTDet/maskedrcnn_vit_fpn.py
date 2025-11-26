@@ -83,6 +83,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         self.matmul = CountedMatmul()
         self.add_decomposed_rel_pos = AddDecomposedRelPos()
 
+    @torch.no_grad()
     def forward(self, image_ndarray: np.ndarray, *args, **kwargs):
         only_backbone = kwargs.get("only_backbone", False)
 
@@ -115,6 +116,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
 
         return boxes, labels, scores
 
+    @torch.no_grad()
     def forward_contexted(
             self, 
             image_ndarray: np.ndarray, 
@@ -213,7 +215,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
                     ape_block = ape
                 ape_block = ape_block * block.norm1.weight
                 # disable for latency measurement: can be done offline
-                ape_block = block.attn.qkv(ape_block).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # ape_block with shape (3, B_attn, nHead, H_attn * W_attn, C)
+                # ape_block = block.attn.qkv(ape_block).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # ape_block with shape (3, B_attn, nHead, H_attn * W_attn, C)
                 
                 # new_cache_feature[fname] = ape_block.clone()[1:]  # for strict cache size management
                 new_cache_feature[fname] = ape_block.clone() # for easy inference
@@ -330,6 +332,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
 
         return (boxes, labels, scores), new_cache_feature, pred_masks
     
+    @torch.no_grad()
     def forward_eventful(
             self, 
             image_ndarray: np.ndarray, 
@@ -547,6 +550,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
 
         return (boxes, labels, scores), new_cache_feature, pred_masks
 
+    @torch.no_grad()
     def forward_maskvd(
             self, 
             image_ndarray: np.ndarray, 
@@ -737,6 +741,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
 
         return (boxes, labels, scores), new_cache_feature, pred_masks
 
+    @torch.no_grad()
     def forward_stgt(
             self, 
             image_ndarray: np.ndarray, 

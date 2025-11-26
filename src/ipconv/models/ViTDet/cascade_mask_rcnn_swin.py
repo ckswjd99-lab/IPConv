@@ -41,13 +41,14 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
         self.matmul = CountedMatmul()
         self.add_decomposed_rel_pos = AddDecomposedRelPos()
 
+    @torch.no_grad()
     def forward(self, image_ndarray: np.ndarray, **kwargs):
         only_backbone = kwargs.get("only_backbone", False)
 
         image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8, device=self.device).permute(2, 0, 1)
         input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
         
-        # detections = self.base_model(input)
+        # Preprocessing
         images = [self.base_model._move_to_current_device(x["image"]) for x in input]
         images = [(x - self.base_model.pixel_mean) / self.base_model.pixel_std for x in images]
         images = ImageList.from_tensors(
@@ -56,10 +57,15 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
             padding_constraints={"size_divisibility": self.base_model.backbone.size_divisibility, "padding_constraints": image_ndarray.shape[0]},
         )
 
-        features = self.base_model.backbone(images.tensor)
-        
+        # [핵심 수정] only_backbone일 경우 FPN(backbone) 대신 bottom_up(Swin)만 실행
         if only_backbone:
+            # self.base_model.backbone(x) -> FPN 포함 (느림)
+            # self.base_model.backbone.bottom_up(x) -> Encoder만 실행 (빠름, FPN 제외)
+            _ = self.base_model.backbone.bottom_up(images.tensor)
             return ([], [], []), {}
+
+        # Inference: Encoder + FPN
+        features = self.base_model.backbone(images.tensor)
 
         proposals, _ = self.proposal_generator(images, features, None)
         results, _ = self.roi_heads(images, features, proposals, None)
@@ -75,6 +81,7 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
     def forward_analyzed(self, image_ndarray: np.ndarray):
         return self.forward(image_ndarray)
     
+    @torch.no_grad()
     def forward_contexted(
         self, 
         image_ndarray: np.ndarray,
@@ -85,7 +92,7 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
         new_cache_feature = {}
 
         # convert to tensor
-        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device).half()
+        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
         batched_inputs = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
 
         # Preprocess image
@@ -322,7 +329,7 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
 
         return (boxes, labels, scores), new_cache_feature, pred_masks
 
-
+    @torch.no_grad()
     def forward_eventful(
         self, 
         image_ndarray: np.ndarray,
@@ -340,7 +347,7 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
         new_cache_feature = {}
 
         # convert to tensor
-        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device).half()
+        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
         batched_inputs = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
 
         # Preprocess image
@@ -577,6 +584,7 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
 
         return (boxes, labels, scores), new_cache_feature, pred_masks
 
+    @torch.no_grad()
     def forward_maskvd(
         self, 
         image_ndarray: np.ndarray,
@@ -587,7 +595,7 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
         new_cache_feature = {}
 
         # convert to tensor
-        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device).half()
+        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
         batched_inputs = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
 
         # Preprocess image
@@ -839,6 +847,7 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
 
         return (boxes, labels, scores), new_cache_feature, pred_masks
     
+    @torch.no_grad()
     def forward_stgt(
         self, 
         image_ndarray: np.ndarray,
@@ -849,7 +858,7 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
         new_cache_feature = {}
 
         # convert to tensor
-        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device).half()
+        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
         batched_inputs = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
 
         # Preprocess image
