@@ -29,6 +29,7 @@ from evaluate_funcs import (
     shift_anchor_features_swin,
     refresh_placing_matrix,
     create_dirtiness_map,
+    create_reference_map,
     create_sensitivity_map,
     expand_mask_neighbors
 )
@@ -220,15 +221,29 @@ def evaluate_sequence(
                     dirty_topk=args.dirty_topk,
                     chromakey = np.array([0, 0, 0], dtype=np.uint8)  # black chromakey
                 )
-
-            if isinstance(dmap_raw, np.ndarray):
-                dmap = torch.from_numpy(dmap_raw).to(global_device)
-            elif isinstance(dmap_raw, torch.Tensor):
-                dmap = dmap_raw.to(global_device)
+            
+            if method == "cstvit":
+                dmap_tensor, refmap = create_reference_map(
+                    anchor_image=ref_frame_aligned,
+                    current_image=image_placed,
+                    dirtiness_map=dmap_raw,
+                    block_size=block_size,
+                    refmap_type=args.refmap_type,
+                    similar_thres=args.similar_thres,
+                    similar_topk=args.similar_topk,
+                )
+                dmap = dmap_tensor.to(global_device)
+                
             else:
-                raise TypeError("Unsupported type for dirtiness map")
+                if isinstance(dmap_raw, np.ndarray):
+                    dmap = torch.from_numpy(dmap_raw).to(global_device)
+                elif isinstance(dmap_raw, torch.Tensor):
+                    dmap = dmap_raw.to(global_device)
+                else:
+                    raise TypeError("Unsupported type for dirtiness map")
         else:
             dmap = torch.ones(1, 64, 64, 1, device=global_device)
+            refmap = torch.tensor(-1, device=global_device, dtype=torch.long).repeat(1, 64, 64, 1)
 
         dmap_ndarray = dmap.squeeze().cpu().numpy()
         dmap_ndarray = cv2.resize(dmap_ndarray, (input_img_size[0], input_img_size[1]), interpolation=cv2.INTER_NEAREST)
@@ -265,6 +280,8 @@ def evaluate_sequence(
         ## INFERENCE ##
         if method == "ours":
             (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_contexted(image_placed, cached_features_dict, dmap_recompute)
+        elif method == "cstvit":
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_cstvit(image_placed, cached_features_dict, dmap_recompute, refmap)
         elif method == "evit":
             (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_eventful(image_placed, cached_features_dict, dmap_recompute)
         elif method == "maskvd":
@@ -344,8 +361,8 @@ def evaluate_sequence(
                     borderValue=0
                 )
 
-                # composite_mask[warped_mask > 127] = i + 1
-                composite_mask[warped_mask > 127] = 255
+                composite_mask[warped_mask > 127] = i + 1
+                # composite_mask[warped_mask > 127] = 255
 
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             imageio.imwrite(save_path, composite_mask)
@@ -415,7 +432,7 @@ def evaluate(
         
         # break
 
-        pbar.set_description(f"meanJ {sum(J_list) / len(J_list):.4f}, meanF {sum(F_list) / len(F_list):.4f}")
+        pbar.set_description(f"meanJ {sum(J_list) / len(J_list):.4f}, meanF {sum(F_list) / len(F_list):.4f}, meanRR {sum(recomp_rate_list) / len(recomp_rate_list):.4f}")
     
     counts = model.total_counts() / n_frames
     model.clear_counts()
@@ -493,7 +510,13 @@ if __name__ == "__main__":
                        help="Dirtiness threshold for the dirtiness map. Default is 30.")
     parser.add_argument("--dirty-topk", type=int, default=100, nargs="?",
                        help="Top-k dirtiness for the dirtiness map. Default is 100.")
-    parser.add_argument("--method", type=str, choices=["ours", "evit", "maskvd", "stgt"], default="ours",
+    parser.add_argument("--refmap-type", type=str, choices=["threshold", "topk"], default="threshold",
+                       help="Type of reference map to use. 'threshold' for thresholding, 'topk' for top-k dirtiness.")
+    parser.add_argument("--similar-thres", type=int, default=10, nargs="?",
+                       help="Similarity threshold for the reference map. Default is 10.")
+    parser.add_argument("--similar-topk", type=int, default=100, nargs="?",
+                       help="Top-k similarity for the reference map. Default is 100.")
+    parser.add_argument("--method", type=str, choices=["ours", "cstvit", "evit", "maskvd", "stgt"], default="ours",
                        help="Method to use for evaluation. 'ours' for IPConv, 'evit' for Eventful ViT.")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to run the evaluation on.")
     parser.add_argument("--roi-expand", type=int, default=1, help="ROI expand factor.")

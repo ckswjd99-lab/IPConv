@@ -15,15 +15,17 @@ from collections import defaultdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch
 
 from typing import List, Dict, Any, Tuple
 
 from datasets.vid import VIDResize, VID
 from ipconv.models import (
-    ViTDeT_b_Imagenet_Contexted, MaskedRCNN_ViT_B_FPN_Contexted, MaskedRCNN_ViT_L_FPN_Contexted, MaskedRCNN_ViT_H_FPN_Contexted,
-    CascadeMaskRCNN_Swin_B_Contexted, CascadeMaskRCNN_Swin_L_Contexted, CascadeMaskRCNN_MViT_B_Contexted,
-    DINO_4Scale_Swin_Contexted, DINO_5Scale_Swin_Contexted,
-    LWDETR_xLarge_Contexted
+    MaskedRCNN_ViT_B_FPN_Contexted, MaskedRCNN_ViT_L_FPN_Contexted, MaskedRCNN_ViT_H_FPN_Contexted,
+    CascadeMaskRCNN_Swin_B_Contexted, CascadeMaskRCNN_Swin_L_Contexted,
+    # CascadeMaskRCNN_MViT_B_Contexted,
+    # DINO_4Scale_Swin_Contexted, DINO_5Scale_Swin_Contexted,
+    # LWDETR_xLarge_Contexted
 )
 from ipconv.models.ViTDet.modeling.backbone.utils import window_reverse, window_partition
 
@@ -39,11 +41,11 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
         "vitdet-b": MaskedRCNN_ViT_B_FPN_Contexted,
         "vitdet-l": MaskedRCNN_ViT_L_FPN_Contexted,
         "vitdet-h": MaskedRCNN_ViT_H_FPN_Contexted,
-        "dino-swin4": DINO_4Scale_Swin_Contexted,
-        "lwdetr": LWDETR_xLarge_Contexted,
+        # "dino-swin4": DINO_4Scale_Swin_Contexted,
+        # "lwdetr": LWDETR_xLarge_Contexted,
         "swin-b": CascadeMaskRCNN_Swin_B_Contexted,
         "swin-l": CascadeMaskRCNN_Swin_L_Contexted,
-        "mvit-b": CascadeMaskRCNN_MViT_B_Contexted,
+        # "mvit-b": CascadeMaskRCNN_MViT_B_Contexted,
     }
 
     models_weight_dict = {
@@ -467,12 +469,17 @@ def create_dirtiness_map(
 
     elif dmap_type == "topk":
         dirtiness_map = cv2.resize(dirtiness_map, (image_W // block_size, image_H // block_size), interpolation=cv2.INTER_AREA)
-        # make top k elements in dirtiness_map to 1, others to 0
+        # make strictly top k elements in dirtiness_map to 1, others to 0
         flat_map = dirtiness_map.flatten()
-        topk_indices = np.argpartition(flat_map, -dirty_topk)[-dirty_topk:]
-        topk_values = flat_map[topk_indices]
-        threshold = topk_values.min()
-        dirtiness_map = (dirtiness_map >= threshold).astype(np.float32)
+        
+        k = min(dirty_topk, len(flat_map))
+        if k > 0:
+            topk_indices = np.argpartition(flat_map, -k)[-k:]
+            new_map = np.zeros_like(flat_map)
+            new_map[topk_indices] = 1.0
+            dirtiness_map = new_map.reshape(dirtiness_map.shape).astype(np.float32)
+        else:
+            dirtiness_map = np.zeros_like(dirtiness_map).astype(np.float32)
     
     dirtiness_map = torch.from_numpy(dirtiness_map)
     dirtiness_map = dirtiness_map.unsqueeze(0).unsqueeze(-1)
@@ -481,6 +488,138 @@ def create_dirtiness_map(
         dirtiness_map[0, 0, 0, 0] = 1
 
     return dirtiness_map
+
+def create_reference_map(
+    anchor_image: np.ndarray, 
+    current_image: np.ndarray,
+    dirtiness_map: torch.Tensor,
+    block_size: int = 16,
+    refmap_type: str = "threshold",
+    similar_thres: int = 30,
+    similar_topk: int = 100,
+):
+    """
+    Creates a reference map containing the index of the most similar patch in the anchor_image 
+    within a 5x5 window for each patch in the current_image.
+    """
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:0')
+    
+    # --- 1. PREPARE INPUTS & MASKS ---
+    device = torch.device('cuda:0')
+    
+    # Handle dirtiness_map early to skip computation if no patches are dirty
+    if isinstance(dirtiness_map, np.ndarray):
+        dmap_t = torch.from_numpy(dirtiness_map).to(device).bool()
+    else:
+        dmap_t = dirtiness_map.to(device).bool()
+        
+    dmap_t = dmap_t.squeeze() # Shape (64, 64)
+    
+    num_blocks_h = current_image.shape[0] // block_size
+    num_blocks_w = current_image.shape[1] // block_size
+    
+    # If no patches are dirty, return early
+    if not dmap_t.any():
+        updated_dmap = torch.zeros(1, num_blocks_h, num_blocks_w, 1, device=device)
+        refmap_out = torch.tensor(-1, device=device, dtype=torch.long).repeat(1, num_blocks_h, num_blocks_w, 1)
+        return updated_dmap, refmap_out
+        
+    # Get indices of dirty patches
+    # Shapes: (N,)
+    dirty_y, dirty_x = torch.where(dmap_t)
+    N = len(dirty_y)
+
+    anchor_t = torch.from_numpy(anchor_image).to(device).float().permute(2, 0, 1).unsqueeze(0) # (1, C, H, W)
+    current_t = torch.from_numpy(current_image).to(device).float().permute(2, 0, 1).unsqueeze(0) # (1, C, H, W)
+    
+    B, C, H, W = anchor_t.shape
+    
+    # --- 2. EXTRACT DIRTY PATCHES (Current) ---
+    # curr_patches: (1, C, num_blocks_h, block_size, num_blocks_w, block_size) -> (C, num_blocks_h, num_blocks_w, block_size, block_size)
+    curr_view = current_t.squeeze(0).view(C, num_blocks_h, block_size, num_blocks_w, block_size)
+    curr_view = curr_view.permute(1, 3, 0, 2, 4) # (num_blocks_h, num_blocks_w, C, block_size, block_size)
+    
+    # Extract only the dirty patches: (N, C, block_size, block_size) -> (N, C * block_size^2)
+    dirty_curr_patches = curr_view[dirty_y, dirty_x].reshape(N, -1)
+    
+    # --- 3. EXTRACT WINDOWS COMPARING TO ANCHOR (5x5) ---
+    search_window_blocks = 5
+    padding_blocks = search_window_blocks // 2  # 2 blocks padding
+    
+    # We will build indices for the 5x5 window (25 candidates) around each dirty patch
+    # Coordinates of the candidates relative to the anchor image
+    dy_grid, dx_grid = torch.meshgrid(
+        torch.arange(-padding_blocks, padding_blocks + 1, device=device),
+        torch.arange(-padding_blocks, padding_blocks + 1, device=device),
+        indexing='ij'
+    )
+    dy_flat = dy_grid.reshape(-1)  # (25,)
+    dx_flat = dx_grid.reshape(-1)  # (25,)
+    
+    # Target window block indices for each dirty patch
+    # Shape: (N, 25)
+    cand_y = torch.clamp(dirty_y.unsqueeze(1) + dy_flat, 0, num_blocks_h - 1)
+    cand_x = torch.clamp(dirty_x.unsqueeze(1) + dx_flat, 0, num_blocks_w - 1)
+    
+    # Pad anchor to view it block-wise easily without border issues if we used unfold,
+    # but here we can just use the calculated clamped indices.
+    anchor_view = anchor_t.squeeze(0).view(C, num_blocks_h, block_size, num_blocks_w, block_size)
+    anchor_view = anchor_view.permute(1, 3, 0, 2, 4) # (num_blocks_h, num_blocks_w, C, block_size, block_size)
+    
+    # Gather candidates: (N, 25, C, block_size, block_size) -> (N, 25, C * block_size^2)
+    cand_patches = anchor_view[cand_y, cand_x].reshape(N, 25, -1)
+    
+    # --- 4. CALCULATE SSD ---
+    # dirty_curr_patches: (N, 1, C*block_size^2)
+    # cand_patches:       (N, 25, C*block_size^2)
+    diff = dirty_curr_patches.unsqueeze(1) - cand_patches
+    ssd = torch.sum(diff ** 2, dim=-1) # Shape: (N, 25)
+    
+    # Find minimum SSD for each dirty patch
+    min_ssd_values, best_match_local_idx = torch.min(ssd, dim=-1) # Shape: (N,)
+    
+    # --- 5. EVALUATE THRESHOLDS / TOP-K ---
+    mask = torch.zeros(N, dtype=torch.bool, device=device)
+    
+    if refmap_type == "topk":
+        k = min(similar_topk, N)
+        if k > 0:
+            _, topk_indices = torch.topk(-min_ssd_values, k)
+            mask[topk_indices] = True
+    elif refmap_type == "threshold":
+        # Any candidate with SSD <= similar_thres is a valid reference match
+        mask = min_ssd_values <= similar_thres
+        
+    # --- 6. ASSEMBLE REFMAP & UPDATED_DMAP ---
+    # Global flat index of the matched candidates
+    # cand_y and cand_x shape: (N, 25)
+    # best_match_local_idx shape: (N,)
+    # Select the target Y, X for the minimum SSD
+    best_target_y = cand_y[torch.arange(N, device=device), best_match_local_idx]
+    best_target_x = cand_x[torch.arange(N, device=device), best_match_local_idx]
+    matched_ref_map = best_target_y * num_blocks_w + best_target_x # (N,)
+    
+    # Output maps
+    refmap_out = torch.tensor(-1, device=device, dtype=torch.long).repeat(num_blocks_h, num_blocks_w)
+    updated_dmap = dmap_t.clone()
+    
+    # Only for the patches that passed the mask condition (subset of N)
+    valid_mask_idx = torch.nonzero(mask, as_tuple=True)[0]
+    
+    y_valid = dirty_y[valid_mask_idx]
+    x_valid = dirty_x[valid_mask_idx]
+    
+    # These patches have a valid reference, so we don't need to recompute them
+    refmap_out[y_valid, x_valid] = matched_ref_map[valid_mask_idx]
+    updated_dmap[y_valid, x_valid] = False # No longer dirty => No recompute
+    
+    # --- 7. FORMAT OUTPUTS ---
+    # Expand dims to match original usages: (1, 64, 64, 1)
+    refmap_out = refmap_out.unsqueeze(0).unsqueeze(-1)
+    updated_dmap = updated_dmap.unsqueeze(0).unsqueeze(-1).float()
+    
+    return updated_dmap, refmap_out
 
 def expand_mask_neighbors(mask_4d: torch.Tensor, expansion: int = 1) -> torch.Tensor:
     if mask_4d.dim() == 2:
