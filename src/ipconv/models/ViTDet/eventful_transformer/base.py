@@ -201,6 +201,8 @@ def dict_string(x, indent=4, value_format=".4g"):
     key_length = max(len(str(key)) for key in x.keys())
     key_format = " " * indent + f"{{:<{key_length + 1}}} {{}}"
 
+    total_comp = 0
+
     for key in sorted(x.keys()):
         val = x[key]
         if isinstance(val, torch.Tensor) and val.numel() == 1:
@@ -210,5 +212,9 @@ def dict_string(x, indent=4, value_format=".4g"):
         else:
             val_str = str(val)
         lines.append(key_format.format(f"{key}:", val_str))
+
+        total_comp += val
+
+    lines.append(key_format.format(f"Total:", total_comp))
 
     return "\n".join(lines)

@@ -509,25 +509,8 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         fname = f"block_out"
         if fname in anchor_features:
             # x: (1, 64, 64, 768), anchor_features[fname]: (1, 64, 64, 768)
-            # 1. default mix
             dmap_channeled = dmap_block.expand(-1, -1, -1, x.shape[-1])    # (1, 64, 64, 768)
-            x_merged = self.add(x * dmap_channeled, anchor_features[fname] * (1 - dmap_channeled))
-            
-            # 2. apply refmap for patches that have a valid reference index (!= -1)
-            B, H, W, C = x.shape
-            needs_ref = (refmap != -1)
-            
-            x_merged_flat = x_merged.view(-1, C)
-            anchor_flat = anchor_features[fname].view(-1, C)
-            needs_ref_flat = needs_ref.view(-1)
-            refmap_flat = refmap.view(-1).long()
-            
-            if needs_ref_flat.any():
-                ref_indices = refmap_flat[needs_ref_flat]
-                x_merged_flat[needs_ref_flat] = anchor_flat[ref_indices]
-                
-            x = x_merged_flat.view(B, H, W, C)
-            
+            x = self.add(x * dmap_channeled, anchor_features[fname] * (1 - dmap_channeled))
         new_cache_feature[fname] = x
 
         if only_backbone:

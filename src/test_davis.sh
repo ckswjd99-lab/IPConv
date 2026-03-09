@@ -1,7 +1,7 @@
-python3 evaluate.py --model "vitdet-l" --frame-rates 30 --dmap-type "topk" --dirty-topk 128 --method "cstvit" --refmap-type "threshold" --similar-thres 200
-python3 evaluate.py --model "vitdet-l" --frame-rates 30 --dmap-type "topk" --dirty-topk 256 --method "cstvit" --refmap-type "threshold" --similar-thres 200
-python3 evaluate.py --model "vitdet-l" --frame-rates 30 --dmap-type "topk" --dirty-topk 512 --method "cstvit" --refmap-type "threshold" --similar-thres 200
-python3 evaluate.py --model "vitdet-l" --frame-rates 30 --dmap-type "topk" --dirty-topk 1024 --method "cstvit" --refmap-type "threshold" --similar-thres 200
+python3 evaluate.py --model "vitdet-l" --frame-rates 30 --dmap-type "topk" --dirty-topk 128 --method "cstvit" --refmap-type "topk" --similar-topk 32
+python3 evaluate.py --model "vitdet-l" --frame-rates 30 --dmap-type "topk" --dirty-topk 256 --method "cstvit" --refmap-type "topk" --similar-topk 64
+python3 evaluate.py --model "vitdet-l" --frame-rates 30 --dmap-type "topk" --dirty-topk 512 --method "cstvit" --refmap-type "topk" --similar-topk 128
+python3 evaluate.py --model "vitdet-l" --frame-rates 30 --dmap-type "topk" --dirty-topk 1024 --method "cstvit" --refmap-type "topk" --similar-topk 256
 # python3 evaluate.py --model "vitdet-l" --frame-rates 30 --dmap-type "topk" --dirty-topk 256 --method "cstvit"
 # python3 evaluate.py --model "vitdet-l" --frame-rates 30 --dmap-type "topk" --dirty-topk 512 --method "cstvit"
 # python3 evaluate.py --model "vitdet-l" --frame-rates 30 --dmap-type "topk" --dirty-topk 1024 --method "cstvit"

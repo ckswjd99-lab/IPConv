@@ -30,6 +30,7 @@ from evaluate_funcs import (
     refresh_placing_matrix,
     create_dirtiness_map,
     create_reference_map,
+    update_cache_with_refmap,
     create_sensitivity_map,
     expand_mask_neighbors
 )
@@ -233,6 +234,7 @@ def evaluate_sequence(
                     similar_topk=args.similar_topk,
                 )
                 dmap = dmap_tensor.to(global_device)
+                cached_features_dict = update_cache_with_refmap(cached_features_dict, refmap)
                 
             else:
                 if isinstance(dmap_raw, np.ndarray):
@@ -479,6 +481,7 @@ def main(args):
         for key, val in counts.items():
             tee_print(key.capitalize(), tee_file)
             tee_print(dict_string(val), tee_file)
+        
 
     print(f"[Saved] Mean J and F written to {output_dir / 'mean_JF.txt'}")
     print(f"mean J: {mean_J:.4f}, mean F: {mean_F:.4f}, mean recomp rate: {mean_recomp_rate:.4f}")
