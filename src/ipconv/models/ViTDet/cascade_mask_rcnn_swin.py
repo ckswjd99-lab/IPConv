@@ -13,7 +13,7 @@ from .structures import ImageList
 import pickle
 import torch.nn.functional as F
 
-from typing import Dict
+from typing import Dict, Tuple
 
 class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
     def __init__(self, num_classes=80, device="cuda"):
@@ -74,6 +74,16 @@ class CascadeMaskRCNN_Swin_Contexted(ExtendedModule):
 
     def forward_analyzed(self, image_ndarray: np.ndarray):
         return self.forward(image_ndarray)
+    
+    def forward_cstvit(
+        self, 
+            image_ndarray: np.ndarray, 
+            anchor_features: Dict[str, torch.Tensor] = {},
+            dirtiness_map: torch.Tensor = torch.ones(1, 256, 256, 1, device="cuda:0"),
+            refmap: torch.Tensor = torch.arange(256 * 256, device="cuda:0").view(1, 256, 256, 1),
+            only_backbone: bool = False,
+    ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], Dict[str, torch.Tensor]]:
+        return self.forward_eventful(image_ndarray, anchor_features, dirtiness_map, only_backbone)
     
     def forward_eventful(
         self, 

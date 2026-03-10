@@ -31,6 +31,7 @@ from evaluate_funcs import (
     create_dirtiness_map,
     create_reference_map,
     update_cache_with_refmap,
+    update_cache_with_refmap_swin,
     create_sensitivity_map,
     expand_mask_neighbors
 )
@@ -234,7 +235,11 @@ def evaluate_sequence(
                     similar_topk=args.similar_topk,
                 )
                 dmap = dmap_tensor.to(global_device)
-                cached_features_dict = update_cache_with_refmap(cached_features_dict, refmap)
+
+                if "Swin" in model.__class__.__name__:
+                    cached_features_dict = update_cache_with_refmap_swin(cached_features_dict, refmap)
+                else:
+                    cached_features_dict = update_cache_with_refmap(cached_features_dict, refmap)
                 
             else:
                 if isinstance(dmap_raw, np.ndarray):

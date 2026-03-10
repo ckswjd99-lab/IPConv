@@ -207,13 +207,13 @@ def dict_string(x, indent=4, value_format=".4g"):
         val = x[key]
         if isinstance(val, torch.Tensor) and val.numel() == 1:
             val = val.item()
+            
         if isinstance(val, (float, int)):
             val_str = f"{val:{value_format}}"
+            total_comp += float(val)  # Always accumulate as float to prevent type casting issues
         else:
             val_str = str(val)
         lines.append(key_format.format(f"{key}:", val_str))
-
-        total_comp += val
 
     lines.append(key_format.format(f"Total:", total_comp))
 

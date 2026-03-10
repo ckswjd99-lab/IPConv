@@ -50,12 +50,12 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
 
     models_weight_dict = {
         # "vitdet-b-imnetvid": "./weights/frcnn_vitdet_final.pth",  # 이 부분!
-        "vitdet-b": "./weights/model_final_61ccd1.pkl",  # 이 부분!
-        "vitdet-l": "./weights/model_final_6146ed.pkl",
-        "vitdet-h": "./weights/model_final_7224f1.pkl",
-        "swin-b": "./weights/model_final_246a82.pkl",
-        "swin-l": "./weights/model_final_7c897e.pkl",
-        "mvit-b": "./weights/model_final_8c3da3.pkl",
+        "vitdet-b": "./weights/vitdet/model_final_61ccd1.pkl",  # 이 부분!
+        "vitdet-l": "./weights/vitdet/model_final_6146ed.pkl",
+        "vitdet-h": "./weights/vitdet/model_final_7224f1.pkl",
+        "swin-b": "./weights/vitdet/model_final_246a82.pkl",
+        "swin-l": "./weights/vitdet/model_final_7c897e.pkl",
+        "mvit-b": "./weights/vitdet/model_final_8c3da3.pkl",
     }
 
     models_settings_dict = {
@@ -698,6 +698,39 @@ def update_cache_with_refmap(cached_features_dict: dict, refmap: torch.Tensor) -
             old_values = value_flat[:, ref_indices, :].clone()
             value_flat[:, needs_ref_indices, :] = old_values
             cached_features_dict[key] = value_flat.view(B, H, W, C)
+
+    return cached_features_dict
+
+def update_cache_with_refmap_swin(cached_features_dict: dict, refmap: torch.Tensor) -> dict:
+    """
+    Updates the cached features based on the reference map.
+    For patches that have a valid reference index (not -1), their features are 
+    replaced by the features from the matched reference index.
+    """
+    if not cached_features_dict:
+        return cached_features_dict
+
+    refmap_flat = refmap.view(-1).long()
+    needs_ref = refmap_flat != -1
+
+    if not needs_ref.any():
+        return cached_features_dict
+
+    ref_indices = refmap_flat[needs_ref]
+    needs_ref_indices = torch.nonzero(needs_ref).squeeze(-1) # indices in 4096
+
+    for key, value in cached_features_dict.items():
+        if "out" in key and "layer2" in key:
+            # value shape: (B, H, W, C)
+            B = 1
+            HW, C = value.shape
+            H = int(math.sqrt(HW))
+            W = H
+
+            value_flat = value.view(B, H * W, C)
+            old_values = value_flat[:, ref_indices, :].clone()
+            value_flat[:, needs_ref_indices, :] = old_values
+            cached_features_dict[key] = value_flat.view(HW, C)
 
     return cached_features_dict
 

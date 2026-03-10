@@ -26,7 +26,9 @@ from evaluate_funcs import (
     create_dirtiness_map,
     create_sensitivity_map,
     expand_mask_neighbors,
-    objdet_coco_to_imvid
+    objdet_coco_to_imvid,
+    create_reference_map,
+    update_cache_with_refmap
 )
 from ipconv.models.ViTDet.modeling.backbone.utils import get_abs_pos
 
@@ -223,14 +225,28 @@ def evaluate_sequence(
                     dirty_topk=dirty_topk
                 )
 
-            if isinstance(dmap_raw, np.ndarray):
-                dmap = torch.from_numpy(dmap_raw).to(global_device)
-            elif isinstance(dmap_raw, torch.Tensor):
-                dmap = dmap_raw.to(global_device)
+            if method == "cstvit":
+                dmap_tensor, refmap = create_reference_map(
+                    anchor_image=ref_frame_aligned,
+                    current_image=image_placed,
+                    dirtiness_map=dmap_raw,
+                    block_size=block_size,
+                    refmap_type=args.refmap_type,
+                    similar_thres=args.similar_thres,
+                    similar_topk=args.similar_topk,
+                )
+                dmap = dmap_tensor.to(global_device)
+                cached_features_dict = update_cache_with_refmap(cached_features_dict, refmap)
             else:
-                raise TypeError("Unsupported type for dirtiness map")
+                if isinstance(dmap_raw, np.ndarray):
+                    dmap = torch.from_numpy(dmap_raw).to(global_device)
+                elif isinstance(dmap_raw, torch.Tensor):
+                    dmap = dmap_raw.to(global_device)
+                else:
+                    raise TypeError("Unsupported type for dirtiness map")
         else:
             dmap = torch.ones(1, 64, 64, 1, device=global_device)
+            refmap = torch.tensor(-1, device=global_device, dtype=torch.long).repeat(1, 64, 64, 1)
 
         dmap_ndarray = dmap.squeeze().cpu().numpy()
         dmap_ndarray = cv2.resize(dmap_ndarray, (input_img_size[0], input_img_size[1]), interpolation=cv2.INTER_NEAREST)
@@ -267,6 +283,8 @@ def evaluate_sequence(
         ## INFERENCE ##
         if method == "ours":
             (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_contexted(image_placed, cached_features_dict, dmap_recompute)
+        elif method == "cstvit":
+            (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_cstvit(image_placed, cached_features_dict, dmap_recompute, refmap)
         elif method == "evit":
             (boxes_cont, labels_cont, scores_cont), cached_features_dict, pred_masks = model.forward_eventful(image_placed, cached_features_dict, dmap_recompute)
         elif method == "maskvd":
@@ -486,7 +504,13 @@ if __name__ == "__main__":
                        help="Top-k dirtiness for the dirtiness map. Default is 100.")
     parser.add_argument("--sensi-expansion", type=int, default=1,
                        help="Expansion factor for the sensitivity map. Default is 1.")
-    parser.add_argument("--method", type=str, choices=["ours", "evit", "maskvd", "stgt"], default="ours",
+    parser.add_argument("--refmap-type", type=str, choices=["threshold", "topk"], default="threshold",
+                       help="Type of reference map to use. 'threshold' for thresholding, 'topk' for top-k dirtiness.")
+    parser.add_argument("--similar-thres", type=int, default=10, nargs="?",
+                       help="Similarity threshold for the reference map. Default is 10.")
+    parser.add_argument("--similar-topk", type=int, default=100, nargs="?",
+                       help="Top-k similarity for the reference map. Default is 100.")
+    parser.add_argument("--method", type=str, choices=["ours", "cstvit", "evit", "maskvd", "stgt"], default="ours",
                        help="Method to use for evaluation. 'ours' for IPConv, 'evit' for Eventful ViT.")
     parser.add_argument("--device", type=str, default="cuda:0",)
     parser.add_argument("--roi-expand", type=int, default=1,
